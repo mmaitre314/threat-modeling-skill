@@ -1,5 +1,9 @@
 // tm7_validate — Validate TM7 files using TMT's own DataContractSerializer types.
 // Auto-discovers the TMT ClickOnce install; override with TMT_DIR env var if needed.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.Serialization;
 using System.Xml;
@@ -138,12 +142,26 @@ class Program
             Console.Write(Path.GetFileName(path) + ": ");
             try
             {
+                // Phase 1: DataContractSerializer deserialization
                 var dcs = new DataContractSerializer(smdType, knownTypes);
                 using (var fs = File.OpenRead(path))
                 using (var reader = XmlDictionaryReader.CreateTextReader(fs, XmlDictionaryReaderQuotas.Max))
                 {
                     var obj = dcs.ReadObject(reader, false);
+                }
+
+                // Phase 2: XML-level model validation (mirrors TMT's own checks)
+                var warnings = ValidateModel(path);
+                if (warnings.Count == 0)
+                {
                     Console.WriteLine("OK");
+                }
+                else
+                {
+                    failures++;
+                    Console.WriteLine("WARN (" + warnings.Count + " issues)");
+                    foreach (var w in warnings)
+                        Console.Error.WriteLine("  " + w);
                 }
             }
             catch (Exception ex)
@@ -167,5 +185,115 @@ class Program
             }
         }
         return failures;
+    }
+
+    /// <summary>
+    /// XML-level validation that mirrors TMT's model-integrity checks.
+    /// Returns a list of human-readable warning strings.
+    /// </summary>
+    static List<string> ValidateModel(string path)
+    {
+        var warnings = new List<string>();
+        var doc = new XmlDocument();
+        doc.Load(path);
+        var nsMgr = new XmlNamespaceManager(doc.NameTable);
+        nsMgr.AddNamespace("tm", "http://schemas.datacontract.org/2004/07/ThreatModeling.Model");
+        nsMgr.AddNamespace("abs", "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts");
+        nsMgr.AddNamespace("a", "http://schemas.microsoft.com/2003/10/Serialization/Arrays");
+        nsMgr.AddNamespace("kb", "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase");
+
+        // Collect known TypeIds from KnowledgeBase (<kb:Id> elements)
+        var knownTypeIds = new HashSet<string>();
+        var kbIdNodes = doc.GetElementsByTagName("Id", "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase");
+        for (int i = 0; i < kbIdNodes.Count; i++)
+        {
+            var text = kbIdNodes[i].InnerText.Trim();
+            if (text.Length > 0)
+                knownTypeIds.Add(text);
+        }
+
+        // Generic type IDs are always valid as TypeIds
+        foreach (var g in new[] { "GE.EI", "GE.P", "GE.DS", "GE.DF", "GE.TB", "GE.TB.L", "GE.TB.B" })
+            knownTypeIds.Add(g);
+
+        // Find all line elements (Connectors/LineBoundaries) by searching for SourceX anywhere
+        // This avoids namespace-path issues since the element names are in the abs namespace
+        var srcXNodes = doc.GetElementsByTagName("SourceX", "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts");
+        for (int i = 0; i < srcXNodes.Count; i++)
+        {
+            var lineNode = srcXNodes[i].ParentNode; // the <a:Value> wrapping Connector/LineBoundary
+            if (lineNode == null) continue;
+
+            var nameNode = lineNode.SelectSingleNode("abs:Properties//kb:Value", nsMgr);
+            var elName = nameNode != null ? nameNode.InnerText.Trim() : "(unnamed)";
+
+            var typeAttr = (lineNode is XmlElement lineEl) ? lineEl.GetAttributeNode("type", "http://www.w3.org/2001/XMLSchema-instance") : null;
+            var lineType = typeAttr != null ? typeAttr.Value : "";
+
+            // Check coordinates are not all zero (TMT: "Line element coordinates are corrupted")
+            int srcX = ParseInt(lineNode, "SourceX", nsMgr);
+            int srcY = ParseInt(lineNode, "SourceY", nsMgr);
+            int tgtX = ParseInt(lineNode, "TargetX", nsMgr);
+            int tgtY = ParseInt(lineNode, "TargetY", nsMgr);
+
+            if (srcX == 0 && srcY == 0 && tgtX == 0 && tgtY == 0)
+                warnings.Add("Line element coordinates are corrupted for '" + elName + "'");
+
+            // Check TypeId is resolvable in KnowledgeBase
+            var typeId = GetText(lineNode, "TypeId", nsMgr);
+            if (!string.IsNullOrEmpty(typeId) && knownTypeIds.Count > 0 && !knownTypeIds.Contains(typeId))
+            {
+                var genericId = GetText(lineNode, "GenericTypeId", nsMgr);
+                warnings.Add("Unable to resolve type '" + typeId + "' for '" + elName + "', reverted to base generic type '" + genericId + "'");
+            }
+
+            // Check SourceGuid/TargetGuid reference valid stencils (for Connectors)
+            if (lineType.Contains("Connector"))
+            {
+                var sourceGuid = GetText(lineNode, "SourceGuid", nsMgr);
+                var targetGuid = GetText(lineNode, "TargetGuid", nsMgr);
+                var nil = "00000000-0000-0000-0000-000000000000";
+                if (sourceGuid == nil || targetGuid == nil)
+                    warnings.Add("Connector '" + elName + "' has unresolved endpoint (nil GUID)");
+            }
+        }
+
+        // Check Borders (stencils) — TypeId resolution
+        var typeIdNodes = doc.GetElementsByTagName("TypeId", "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts");
+        for (int i = 0; i < typeIdNodes.Count; i++)
+        {
+            var parent = typeIdNodes[i].ParentNode;
+            if (parent == null) continue;
+            // Skip lines (already checked above) — only check stencils
+            var typeAttr2 = (parent is XmlElement pEl) ? pEl.GetAttributeNode("type", "http://www.w3.org/2001/XMLSchema-instance") : null;
+            if (typeAttr2 != null && (typeAttr2.Value.Contains("Connector") || typeAttr2.Value.Contains("LineBoundary")))
+                continue;
+            // Skip KnowledgeBase elements
+            if (typeAttr2 == null) continue;
+
+            var typeId = typeIdNodes[i].InnerText.Trim();
+            if (!string.IsNullOrEmpty(typeId) && knownTypeIds.Count > 0 && !knownTypeIds.Contains(typeId))
+            {
+                var nameNode = parent.SelectSingleNode("abs:Properties//kb:Value", nsMgr);
+                var elName = nameNode != null ? nameNode.InnerText.Trim() : "(unnamed)";
+                var genericId = GetText(parent, "GenericTypeId", nsMgr);
+                warnings.Add("Unable to resolve type '" + typeId + "' for '" + elName + "', reverted to base generic type '" + genericId + "'");
+            }
+        }
+
+        return warnings;
+    }
+
+    static string GetText(XmlNode parent, string localName, XmlNamespaceManager nsMgr)
+    {
+        var node = parent.SelectSingleNode("abs:" + localName, nsMgr);
+        return node != null ? node.InnerText.Trim() : "";
+    }
+
+    static int ParseInt(XmlNode parent, string localName, XmlNamespaceManager nsMgr)
+    {
+        var text = GetText(parent, localName, nsMgr);
+        int val;
+        return int.TryParse(text, out val) ? val : 0;
     }
 }

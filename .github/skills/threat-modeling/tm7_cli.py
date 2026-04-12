@@ -849,10 +849,14 @@ def _stencil_xml(guid: str, generic_type: str, type_id: str, name: str,
 
 
 def _line_boundary_xml(guid: str, generic_type: str, type_id: str, name: str,
-                       NS: dict, z_id: str = "") -> str:
+                       NS: dict, z_id: str = "",
+                       source_x: int = 297, source_y: int = 10,
+                       target_x: int = 294, target_y: int = 306) -> str:
     """Build a ``KeyValueOfguidanyType`` XML fragment for a LineBoundary."""
     zattr = f' z:Id="{z_id}" xmlns:z="http://schemas.microsoft.com/2003/10/Serialization/"' if z_id else ""
     nil_guid = "00000000-0000-0000-0000-000000000000"
+    handle_x = (source_x + target_x) // 2
+    handle_y = (source_y + target_y) // 2
     return (
         f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">' 
         f"<a:Key>{_xml_escape(guid)}</a:Key>"
@@ -865,16 +869,16 @@ def _line_boundary_xml(guid: str, generic_type: str, type_id: str, name: str,
         f'<c:Value i:type="d:string" xmlns:d="{NS["xs"]}">{_xml_escape(name)}</c:Value>'
         f"</b:anyType></Properties>"
         f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(type_id)}</TypeId>'
-        f'<HandleX xmlns="{NS["abs"]}">294</HandleX>'
-        f'<HandleY xmlns="{NS["abs"]}">250</HandleY>'
+        f'<HandleX xmlns="{NS["abs"]}">{handle_x}</HandleX>'
+        f'<HandleY xmlns="{NS["abs"]}">{handle_y}</HandleY>'
         f'<PortSource xmlns="{NS["abs"]}">None</PortSource>'
         f'<PortTarget xmlns="{NS["abs"]}">None</PortTarget>'
         f'<SourceGuid xmlns="{NS["abs"]}">{nil_guid}</SourceGuid>'
-        f'<SourceX xmlns="{NS["abs"]}">297</SourceX>'
-        f'<SourceY xmlns="{NS["abs"]}">10</SourceY>'
+        f'<SourceX xmlns="{NS["abs"]}">{source_x}</SourceX>'
+        f'<SourceY xmlns="{NS["abs"]}">{source_y}</SourceY>'
         f'<TargetGuid xmlns="{NS["abs"]}">{nil_guid}</TargetGuid>'
-        f'<TargetX xmlns="{NS["abs"]}">294</TargetX>'
-        f'<TargetY xmlns="{NS["abs"]}">306</TargetY>'
+        f'<TargetX xmlns="{NS["abs"]}">{target_x}</TargetX>'
+        f'<TargetY xmlns="{NS["abs"]}">{target_y}</TargetY>'
         f"</a:Value></a:KeyValueOfguidanyType>"
     )
 
@@ -951,10 +955,11 @@ class TM7Generator:
             )
 
         # --- Borders (elements only, with z:Id starting at i3 to avoid template's i1,i2) ---
-        text = _splice_section(text, "Borders", self._borders_xml(model, z_id_start=3))
+        borders_xml, el_positions = self._borders_xml(model, z_id_start=3)
+        text = _splice_section(text, "Borders", borders_xml)
         # --- Lines (flows + trust boundaries, z:Id continues after borders) ---
         lines_z_start = 3 + len(model.elements)
-        text = _splice_section(text, "Lines", self._lines_xml(model, z_id_start=lines_z_start))
+        text = _splice_section(text, "Lines", self._lines_xml(model, el_positions, z_id_start=lines_z_start))
         # --- ThreatInstances ---
         ds_m = re.search(r"<Guid[^>]*>([0-9a-fA-F-]+)</Guid>", text)
         ds_guid = ds_m.group(1) if ds_m else str(uuid.uuid4())
@@ -965,9 +970,10 @@ class TM7Generator:
     # --- fragment builders (self-contained namespace declarations) ---
 
     @staticmethod
-    def _borders_xml(model: ThreatModel, z_id_start: int = 3) -> str:
+    def _borders_xml(model: ThreatModel, z_id_start: int = 3) -> tuple[str, dict]:
+        """Return (xml_fragment, {guid: (left, top, width, height)})."""
         if not model.elements:
-            return ""
+            return "", {}
         NS = {
             "a": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
             "abs": "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts",
@@ -976,18 +982,24 @@ class TM7Generator:
             "xs": "http://www.w3.org/2001/XMLSchema",
         }
         parts: list[str] = []
+        positions: dict[str, tuple[int, int, int, int]] = {}
         x_pos = 50.0
         z_id = z_id_start
         for el in model.elements:
+            left = int(x_pos)
+            top = 100
+            w = int(el.width)
+            h = int(el.height)
             parts.append(_stencil_xml(el.guid, el.generic_type, el.type_id or el.generic_type,
-                                      el.name, int(el.height), int(x_pos), 100, int(el.width), 1, NS,
+                                      el.name, h, left, top, w, 1, NS,
                                       z_id=f"i{z_id}"))
+            positions[el.guid] = (left, top, w, h)
             x_pos += 250.0
             z_id += 1
-        return "".join(parts)
+        return "".join(parts), positions
 
     @staticmethod
-    def _lines_xml(model: ThreatModel, z_id_start: int = 3) -> str:
+    def _lines_xml(model: ThreatModel, el_positions: dict, z_id_start: int = 3) -> str:
         if not model.flows and not model.boundaries:
             return ""
         name_to_guid = {e.name: e.guid for e in model.elements}
@@ -1004,8 +1016,22 @@ class TM7Generator:
             sg = name_to_guid.get(df.source_guid, df.source_guid)
             tg = name_to_guid.get(df.target_guid, df.target_guid)
             df.source_guid, df.target_guid = sg, tg
+            # Compute connector coordinates from element positions
+            sx, sy, sw, sh = el_positions.get(sg, (0, 100, 100, 100))
+            tx, ty, tw, th = el_positions.get(tg, (250, 100, 100, 100))
+            src_cx, src_cy = sx + sw // 2, sy + sh // 2
+            tgt_cx, tgt_cy = tx + tw // 2, ty + th // 2
+            # Source point: right edge of source element
+            source_x = sx + sw
+            source_y = src_cy
+            # Target point: left edge of target element
+            target_x = tx
+            target_y = tgt_cy
+            # Handle: midpoint of the connector line
+            handle_x = (source_x + target_x) // 2
+            handle_y = (source_y + target_y) // 2
             parts.append(
-                f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">' 
+                f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
                 f"<a:Key>{_xml_escape(df.guid)}</a:Key>"
                 f'<a:Value z:Id="i{z_id}" xmlns:z="http://schemas.microsoft.com/2003/10/Serialization/" xmlns:i="{NS["i"]}" i:type="Connector">'
                 f'<GenericTypeId xmlns="{NS["abs"]}">{_xml_escape(df.generic_type)}</GenericTypeId>'
@@ -1016,26 +1042,38 @@ class TM7Generator:
                 f'<c:Value i:type="d:string" xmlns:d="{NS["xs"]}">{_xml_escape(df.name)}</c:Value>'
                 f"</b:anyType></Properties>"
                 f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(df.type_id or "GE.DF")}</TypeId>'
-                f'<HandleX xmlns="{NS["abs"]}">0</HandleX>'
-                f'<HandleY xmlns="{NS["abs"]}">0</HandleY>'
+                f'<HandleX xmlns="{NS["abs"]}">{handle_x}</HandleX>'
+                f'<HandleY xmlns="{NS["abs"]}">{handle_y}</HandleY>'
                 f'<PortSource xmlns="{NS["abs"]}">East</PortSource>'
                 f'<PortTarget xmlns="{NS["abs"]}">West</PortTarget>'
                 f'<SourceGuid xmlns="{NS["abs"]}">{_xml_escape(sg)}</SourceGuid>'
-                f'<SourceX xmlns="{NS["abs"]}">0</SourceX>'
-                f'<SourceY xmlns="{NS["abs"]}">0</SourceY>'
+                f'<SourceX xmlns="{NS["abs"]}">{source_x}</SourceX>'
+                f'<SourceY xmlns="{NS["abs"]}">{source_y}</SourceY>'
                 f'<TargetGuid xmlns="{NS["abs"]}">{_xml_escape(tg)}</TargetGuid>'
-                f'<TargetX xmlns="{NS["abs"]}">0</TargetX>'
-                f'<TargetY xmlns="{NS["abs"]}">0</TargetY>'
+                f'<TargetX xmlns="{NS["abs"]}">{target_x}</TargetX>'
+                f'<TargetY xmlns="{NS["abs"]}">{target_y}</TargetY>'
                 f"</a:Value></a:KeyValueOfguidanyType>"
             )
             z_id += 1
-        # Trust boundaries as LineBoundary entries
+        # Trust boundaries as LineBoundary entries — vertical line spanning elements
+        if el_positions:
+            all_tops = [t for _, t, _, _ in el_positions.values()]
+            all_bottoms = [t + h for _, t, _, h in el_positions.values()]
+            tb_min_y = min(all_tops) - 20
+            tb_max_y = max(all_bottoms) + 20
+        else:
+            tb_min_y, tb_max_y = 10, 306
+        tb_x_offset = 0
         for tb in model.boundaries:
             tb_generic = "GE.TB.L" if tb.generic_type == "GE.TB" else tb.generic_type
+            # Place boundary line between elements; shift each boundary right
+            tb_x = 270 + tb_x_offset
+            tb_x_offset += 250
             parts.append(_line_boundary_xml(
-                tb.guid, tb_generic, "SE.TB.L.TMCore.Internet",
-                tb.name, NS, z_id=f"i{z_id}"))
-            z_id += 1
+                tb.guid, tb_generic, tb_generic,
+                tb.name, NS, z_id=f"i{z_id}",
+                source_x=tb_x, source_y=tb_min_y,
+                target_x=tb_x, target_y=tb_max_y))
         return "".join(parts)
 
     @staticmethod
