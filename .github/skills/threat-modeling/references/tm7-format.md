@@ -13,14 +13,17 @@ TM7 is the XML file format used by the [Microsoft Threat Modeling Tool](https://
 
 ## Top-Level Structure
 
+All of the following child elements are **required** — TMT will fail to deserialize
+the file if any are missing.
+
 ```xml
 <ThreatModel>
   <DrawingSurfaceList>         <!-- Visual diagrams (DFD pages) -->
     <DrawingSurfaceModel>
       <Borders>                <!-- Elements: Processes, Data Stores, External Interactors, Trust Boundaries -->
       <Lines>                  <!-- Data Flows and line-type Trust Boundaries -->
-      <Header>                 <!-- Diagram name -->
-      <Zoom>                   <!-- Zoom level -->
+      <Header>                 <!-- Diagram tab label -->
+      <Zoom>                   <!-- Zoom level (1 = 100%) -->
     </DrawingSurfaceModel>
   </DrawingSurfaceList>
   <MetaInformation>            <!-- Model metadata -->
@@ -36,8 +39,11 @@ TM7 is the XML file format used by the [Microsoft Threat Modeling Tool](https://
   <ThreatInstances>            <!-- Generated/custom threats -->
   <ThreatGenerationEnabled>    <!-- true/false -->
   <Validations>                <!-- Validation results -->
-  <Version>                    <!-- Format version (2.0) -->
-  <KnowledgeBase>              <!-- Element types, threat generation rules -->
+  <Version>                    <!-- Format version (e.g. 4.3) -->
+  <KnowledgeBase>              <!-- Element types, threat generation rules (~1 MB) -->
+  <Profile>                    <!-- Template profile -->
+    <PromptedKb />
+  </Profile>
 </ThreatModel>
 ```
 
@@ -51,7 +57,7 @@ TM7 is the XML file format used by the [Microsoft Threat Modeling Tool](https://
 | `GE.DF` | Data Flow | Arrow/connector |
 | `GE.TB` | Trust Boundary (rectangular) | Dashed rectangle |
 | `GE.TB.L` | Trust Boundary (line) | Dashed line |
-| `GE.S` | Drawing Surface | Container |
+| `DRAWINGSURFACE` | Drawing Surface | Container (the diagram page itself) |
 
 ## Common TypeIds
 
@@ -168,3 +174,45 @@ Each element has a `Properties` collection of typed attributes:
 | `941f9317-678b-4a2e-807a-a820331bec42` | Team |
 | `44490cdf-6399-4291-9bde-03dca6f03c11` | Mitigation |
 | `bc9c6e2a-15d0-4863-9cac-589e51e4ca1e` | Priority |
+
+## Serialization Gotchas
+
+TMT uses .NET **DataContractSerializer** which produces XML with several
+quirks that must be preserved for the file to load successfully.
+
+### `z:Id` / `z:Ref` Reference Attributes
+
+DataContractSerializer emits `z:Id="i1"` attributes (namespace
+`http://schemas.microsoft.com/2003/10/Serialization/`) on objects it
+serializes.  `DrawingSurfaceModel` and `KnowledgeBase` carry these.
+Dropping or renumbering them causes deserialization failures.
+
+### Namespace-Prefixed `xsi:type` Values
+
+Attribute values like `i:type="b:StringDisplayAttribute"` contain a
+**namespace prefix** (`b:`) that is resolved against the `xmlns:b`
+declaration **on or above that element**.  Python's `xml.etree.ElementTree`
+hoists namespace declarations to the root on write, reassigning prefixes.
+This silently corrupts every `xsi:type` value because the prefix now
+points to a different namespace.
+
+**Workaround:** The CLI uses raw-text splicing (`_generate_from_template`)
+instead of `ElementTree.write()` when a template is available.  Only the
+variable sections (MetaInformation children, Borders, Lines,
+ThreatInstances) are replaced via regex; all other bytes are preserved
+verbatim.
+
+### KnowledgeBase and Profile Are Required
+
+TMT's `KnowledgeBase..ctor` throws a `NullReferenceException` if the
+`<KnowledgeBase>` element is absent.  The `<Profile>` element (containing
+`<PromptedKb />`) is also required.  Together they account for ~1 MB of
+XML in every TM7 file.
+
+### Whitespace Sensitivity
+
+DataContractSerializer treats element text content literally — a
+`<ThreatModelName>` with leading/trailing whitespace or newlines will
+load that whitespace as part of the model name.  Do not auto-format
+TM7 files.  The `references/` directory includes a `.gitattributes`
+marking `*.tm7` as binary to prevent this.

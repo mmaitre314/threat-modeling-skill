@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import textwrap
 import uuid
 from pathlib import Path
@@ -28,6 +29,8 @@ from tm7_cli import (
     ThreatModel,
     ThreatModelMeta,
     TrustBoundary,
+    _splice_section,
+    _xml_escape,
     generate_summary,
     validate_markdown,
 )
@@ -476,6 +479,121 @@ class TestTM7Generator:
 
 
 # ===================================================================
+# Text-Based Generation Tests
+# ===================================================================
+
+
+class TestTM7GeneratorText:
+    """Tests for the template-safe text-based generation path."""
+
+    def test_generate_text_returns_string(self, sample_model: ThreatModel):
+        text = TM7Generator().generate_text(sample_model)
+        assert isinstance(text, str)
+        assert "<ThreatModel" in text
+
+    def test_generate_text_has_metadata(self, sample_model: ThreatModel):
+        text = TM7Generator().generate_text(sample_model)
+        assert "Test System" in text
+        assert "Alice" in text
+
+    def test_generate_text_preserves_kb(self, sample_model: ThreatModel):
+        text = TM7Generator().generate_text(sample_model)
+        assert "KnowledgeBase" in text
+        assert "ThreatCategories" in text
+
+    def test_generate_text_preserves_profile(self, sample_model: ThreatModel):
+        text = TM7Generator().generate_text(sample_model)
+        assert "<Profile" in text
+        assert "PromptedKb" in text
+
+    def test_generate_text_has_elements(self, sample_model: ThreatModel):
+        text = TM7Generator().generate_text(sample_model)
+        assert "User" in text
+        assert "Web App" in text
+        assert "Database" in text
+
+    def test_generate_text_has_threats(self, sample_model: ThreatModel):
+        text = TM7Generator().generate_text(sample_model)
+        assert "SQL Injection" in text
+        assert "XSS" in text
+
+    def test_write_produces_parseable_tm7(self, sample_model: ThreatModel, tmp_path: Path):
+        out = tmp_path / "out.tm7"
+        TM7Generator().write(sample_model, out)
+        model2 = TM7Parser(out).parse()
+        assert len(model2.elements) >= 3
+        assert len(model2.threats) == 2
+
+    def test_write_preserves_zid_attributes(self, sample_model: ThreatModel, tmp_path: Path):
+        """z:Id attributes from the template must survive text-based generation."""
+        out = tmp_path / "out.tm7"
+        TM7Generator().write(sample_model, out)
+        raw = out.read_bytes().decode("utf-8")
+        ids = re.findall(r'[zc]:Id="[^"]+"', raw)
+        assert len(ids) >= 2, f"Expected z:Id/c:Id attributes, found: {ids}"
+
+    def test_write_no_xml_declaration(self, sample_model: ThreatModel, tmp_path: Path):
+        """TMT files have no XML declaration — the output should start with <ThreatModel."""
+        out = tmp_path / "out.tm7"
+        TM7Generator().write(sample_model, out)
+        raw = out.read_bytes().decode("utf-8")
+        assert raw.startswith("<ThreatModel")
+
+    def test_empty_model_produces_valid_output(self, tmp_path: Path):
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Empty")
+        out = tmp_path / "empty.tm7"
+        TM7Generator().write(model, out)
+        model2 = TM7Parser(out).parse()
+        assert model2.meta.name == "Empty"
+        assert model2.elements == []
+        assert model2.threats == []
+
+
+# ===================================================================
+# Helper Function Tests
+# ===================================================================
+
+
+class TestXmlEscape:
+    def test_ampersand(self):
+        assert _xml_escape("a&b") == "a&amp;b"
+
+    def test_lt_gt(self):
+        assert _xml_escape("<tag>") == "&lt;tag&gt;"
+
+    def test_quotes(self):
+        assert _xml_escape('say "hi"') == 'say &quot;hi&quot;'
+
+    def test_no_change_for_plain_text(self):
+        assert _xml_escape("hello world") == "hello world"
+
+
+class TestSpliceSection:
+    def test_replace_empty_tag(self):
+        xml = '<Root><Items /><Other>keep</Other></Root>'
+        result = _splice_section(xml, "Items", "<a>1</a>")
+        assert "<a>1</a></Items>" in result
+        assert "<Other>keep</Other>" in result
+
+    def test_replace_existing_content(self):
+        xml = '<Root><Items><old>x</old></Items></Root>'
+        result = _splice_section(xml, "Items", "<new>y</new>")
+        assert "<new>y</new>" in result
+        assert "<old>x</old>" not in result
+
+    def test_replace_with_empty(self):
+        xml = '<Root><Items><old>x</old></Items></Root>'
+        result = _splice_section(xml, "Items", "")
+        assert "<Items></Items>" in result
+
+    def test_preserves_namespace_prefix(self):
+        xml = '<Root><ns:Items xmlns:ns="urn:test"><old>x</old></ns:Items></Root>'
+        result = _splice_section(xml, "Items", "<a>1</a>")
+        assert "<a>1</a></ns:Items>" in result
+
+
+# ===================================================================
 # TM7 Parser Tests (sample files)
 # ===================================================================
 
@@ -579,10 +697,8 @@ class TestTM7RoundTrip:
         md_path.write_text(md, encoding="utf-8")
 
         model2 = MarkdownParser(md_path).parse()
-        gen = TM7Generator()
-        tree = gen.generate(model2)
         tm7_path = tmp_path / "out.tm7"
-        tree.write(str(tm7_path), encoding="unicode", xml_declaration=True)
+        TM7Generator().write(model2, tm7_path)
 
         model3 = TM7Parser(tm7_path).parse()
         assert len(model3.elements) >= len(model1.elements)
@@ -597,10 +713,8 @@ class TestTM7RoundTrip:
         md_path.write_text(md, encoding="utf-8")
 
         model2 = MarkdownParser(md_path).parse()
-        gen = TM7Generator()
-        tree = gen.generate(model2)
         tm7_path = tmp_path / "out.tm7"
-        tree.write(str(tm7_path), encoding="unicode", xml_declaration=True)
+        TM7Generator().write(model2, tm7_path)
 
         model3 = TM7Parser(tm7_path).parse()
         states1 = {t.title: t.state for t in model1.threats}
@@ -615,10 +729,8 @@ class TestTM7RoundTrip:
         md_path.write_text(md, encoding="utf-8")
 
         model2 = MarkdownParser(md_path).parse()
-        gen = TM7Generator()
-        tree = gen.generate(model2)
         tm7_path = tmp_path / "out.tm7"
-        tree.write(str(tm7_path), encoding="unicode", xml_declaration=True)
+        TM7Generator().write(model2, tm7_path)
 
         model3 = TM7Parser(tm7_path).parse()
         cats1 = {t.title: t.category for t in model1.threats}
@@ -633,10 +745,8 @@ class TestTM7RoundTrip:
         md_path.write_text(md, encoding="utf-8")
 
         model2 = MarkdownParser(md_path).parse()
-        gen = TM7Generator()
-        tree = gen.generate(model2)
         tm7_path = tmp_path / "out.tm7"
-        tree.write(str(tm7_path), encoding="unicode", xml_declaration=True)
+        TM7Generator().write(model2, tm7_path)
 
         model3 = TM7Parser(tm7_path).parse()
         ids1 = {t.title: t.id for t in model1.threats}
