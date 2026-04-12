@@ -813,14 +813,24 @@ def _splice_section(text: str, tag: str, inner: str) -> str:
     return re.sub(pattern, _repl, text, count=1, flags=re.DOTALL)
 
 
+# Map GenericTypeId to DataContractSerializer i:type for stencil shapes
+_STENCIL_SHAPE = {
+    "GE.EI": "StencilRectangle",
+    "GE.P": "StencilEllipse",
+    "GE.DS": "StencilParallelLines",
+}
+
+
 def _stencil_xml(guid: str, generic_type: str, type_id: str, name: str,
                  height: int, left: int, top: int, width: int,
-                 stroke: int, NS: dict) -> str:
-    """Build a ``KeyValueOfguidanyType`` XML fragment for a stencil rectangle."""
+                 stroke: int, NS: dict, z_id: str = "") -> str:
+    """Build a ``KeyValueOfguidanyType`` XML fragment for a stencil."""
+    shape = _STENCIL_SHAPE.get(generic_type, "StencilRectangle")
+    zattr = f' z:Id="{z_id}" xmlns:z="http://schemas.microsoft.com/2003/10/Serialization/"' if z_id else ""
     return (
-        f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
+        f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">' 
         f"<a:Key>{_xml_escape(guid)}</a:Key>"
-        f'<a:Value xmlns:i="{NS["i"]}" i:type="StencilRectangle">'
+        f'<a:Value{zattr} xmlns:i="{NS["i"]}" i:type="{shape}">'
         f'<GenericTypeId xmlns="{NS["abs"]}">{_xml_escape(generic_type)}</GenericTypeId>'
         f'<Guid xmlns="{NS["abs"]}">{_xml_escape(guid)}</Guid>'
         f'<Properties xmlns="{NS["abs"]}" xmlns:b="{NS["a"]}">'
@@ -834,6 +844,37 @@ def _stencil_xml(guid: str, generic_type: str, type_id: str, name: str,
         f'<StrokeThickness xmlns="{NS["abs"]}">{stroke}</StrokeThickness>'
         f'<Top xmlns="{NS["abs"]}">{top}</Top>'
         f'<Width xmlns="{NS["abs"]}">{width}</Width>'
+        f"</a:Value></a:KeyValueOfguidanyType>"
+    )
+
+
+def _line_boundary_xml(guid: str, generic_type: str, type_id: str, name: str,
+                       NS: dict, z_id: str = "") -> str:
+    """Build a ``KeyValueOfguidanyType`` XML fragment for a LineBoundary."""
+    zattr = f' z:Id="{z_id}" xmlns:z="http://schemas.microsoft.com/2003/10/Serialization/"' if z_id else ""
+    nil_guid = "00000000-0000-0000-0000-000000000000"
+    return (
+        f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">' 
+        f"<a:Key>{_xml_escape(guid)}</a:Key>"
+        f'<a:Value{zattr} xmlns:i="{NS["i"]}" i:type="LineBoundary">'
+        f'<GenericTypeId xmlns="{NS["abs"]}">{_xml_escape(generic_type)}</GenericTypeId>'
+        f'<Guid xmlns="{NS["abs"]}">{_xml_escape(guid)}</Guid>'
+        f'<Properties xmlns="{NS["abs"]}" xmlns:b="{NS["a"]}">'
+        f'<b:anyType i:type="c:StringDisplayAttribute" xmlns:c="{NS["kb"]}">'
+        f"<c:DisplayName>Name</c:DisplayName><c:Name />"
+        f'<c:Value i:type="d:string" xmlns:d="{NS["xs"]}">{_xml_escape(name)}</c:Value>'
+        f"</b:anyType></Properties>"
+        f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(type_id)}</TypeId>'
+        f'<HandleX xmlns="{NS["abs"]}">294</HandleX>'
+        f'<HandleY xmlns="{NS["abs"]}">250</HandleY>'
+        f'<PortSource xmlns="{NS["abs"]}">None</PortSource>'
+        f'<PortTarget xmlns="{NS["abs"]}">None</PortTarget>'
+        f'<SourceGuid xmlns="{NS["abs"]}">{nil_guid}</SourceGuid>'
+        f'<SourceX xmlns="{NS["abs"]}">297</SourceX>'
+        f'<SourceY xmlns="{NS["abs"]}">10</SourceY>'
+        f'<TargetGuid xmlns="{NS["abs"]}">{nil_guid}</TargetGuid>'
+        f'<TargetX xmlns="{NS["abs"]}">294</TargetX>'
+        f'<TargetY xmlns="{NS["abs"]}">306</TargetY>'
         f"</a:Value></a:KeyValueOfguidanyType>"
     )
 
@@ -909,10 +950,11 @@ class TM7Generator:
                 text, count=1,
             )
 
-        # --- Borders ---
-        text = _splice_section(text, "Borders", self._borders_xml(model))
-        # --- Lines ---
-        text = _splice_section(text, "Lines", self._lines_xml(model))
+        # --- Borders (elements only, with z:Id starting at i3 to avoid template's i1,i2) ---
+        text = _splice_section(text, "Borders", self._borders_xml(model, z_id_start=3))
+        # --- Lines (flows + trust boundaries, z:Id continues after borders) ---
+        lines_z_start = 3 + len(model.elements)
+        text = _splice_section(text, "Lines", self._lines_xml(model, z_id_start=lines_z_start))
         # --- ThreatInstances ---
         ds_m = re.search(r"<Guid[^>]*>([0-9a-fA-F-]+)</Guid>", text)
         ds_guid = ds_m.group(1) if ds_m else str(uuid.uuid4())
@@ -923,8 +965,8 @@ class TM7Generator:
     # --- fragment builders (self-contained namespace declarations) ---
 
     @staticmethod
-    def _borders_xml(model: ThreatModel) -> str:
-        if not model.elements and not model.boundaries:
+    def _borders_xml(model: ThreatModel, z_id_start: int = 3) -> str:
+        if not model.elements:
             return ""
         NS = {
             "a": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
@@ -935,18 +977,18 @@ class TM7Generator:
         }
         parts: list[str] = []
         x_pos = 50.0
+        z_id = z_id_start
         for el in model.elements:
             parts.append(_stencil_xml(el.guid, el.generic_type, el.type_id or el.generic_type,
-                                      el.name, int(el.height), int(x_pos), 100, int(el.width), 1, NS))
+                                      el.name, int(el.height), int(x_pos), 100, int(el.width), 1, NS,
+                                      z_id=f"i{z_id}"))
             x_pos += 250.0
-        for tb in model.boundaries:
-            parts.append(_stencil_xml(tb.guid, tb.generic_type, tb.generic_type,
-                                      tb.name, 300, 10, 10, 800, 2, NS))
+            z_id += 1
         return "".join(parts)
 
     @staticmethod
-    def _lines_xml(model: ThreatModel) -> str:
-        if not model.flows:
+    def _lines_xml(model: ThreatModel, z_id_start: int = 3) -> str:
+        if not model.flows and not model.boundaries:
             return ""
         name_to_guid = {e.name: e.guid for e in model.elements}
         NS = {
@@ -957,14 +999,15 @@ class TM7Generator:
             "xs": "http://www.w3.org/2001/XMLSchema",
         }
         parts: list[str] = []
+        z_id = z_id_start
         for df in model.flows:
             sg = name_to_guid.get(df.source_guid, df.source_guid)
             tg = name_to_guid.get(df.target_guid, df.target_guid)
             df.source_guid, df.target_guid = sg, tg
             parts.append(
-                f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
+                f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">' 
                 f"<a:Key>{_xml_escape(df.guid)}</a:Key>"
-                f'<a:Value xmlns:i="{NS["i"]}" i:type="Connector">'
+                f'<a:Value z:Id="i{z_id}" xmlns:z="http://schemas.microsoft.com/2003/10/Serialization/" xmlns:i="{NS["i"]}" i:type="Connector">'
                 f'<GenericTypeId xmlns="{NS["abs"]}">{_xml_escape(df.generic_type)}</GenericTypeId>'
                 f'<Guid xmlns="{NS["abs"]}">{_xml_escape(df.guid)}</Guid>'
                 f'<Properties xmlns="{NS["abs"]}" xmlns:b="{NS["a"]}">'
@@ -973,10 +1016,26 @@ class TM7Generator:
                 f'<c:Value i:type="d:string" xmlns:d="{NS["xs"]}">{_xml_escape(df.name)}</c:Value>'
                 f"</b:anyType></Properties>"
                 f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(df.type_id or "GE.DF")}</TypeId>'
+                f'<HandleX xmlns="{NS["abs"]}">0</HandleX>'
+                f'<HandleY xmlns="{NS["abs"]}">0</HandleY>'
+                f'<PortSource xmlns="{NS["abs"]}">East</PortSource>'
+                f'<PortTarget xmlns="{NS["abs"]}">West</PortTarget>'
                 f'<SourceGuid xmlns="{NS["abs"]}">{_xml_escape(sg)}</SourceGuid>'
+                f'<SourceX xmlns="{NS["abs"]}">0</SourceX>'
+                f'<SourceY xmlns="{NS["abs"]}">0</SourceY>'
                 f'<TargetGuid xmlns="{NS["abs"]}">{_xml_escape(tg)}</TargetGuid>'
+                f'<TargetX xmlns="{NS["abs"]}">0</TargetX>'
+                f'<TargetY xmlns="{NS["abs"]}">0</TargetY>'
                 f"</a:Value></a:KeyValueOfguidanyType>"
             )
+            z_id += 1
+        # Trust boundaries as LineBoundary entries
+        for tb in model.boundaries:
+            tb_generic = "GE.TB.L" if tb.generic_type == "GE.TB" else tb.generic_type
+            parts.append(_line_boundary_xml(
+                tb.guid, tb_generic, "SE.TB.L.TMCore.Internet",
+                tb.name, NS, z_id=f"i{z_id}"))
+            z_id += 1
         return "".join(parts)
 
     @staticmethod

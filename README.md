@@ -37,6 +37,9 @@ python tm7_cli.py summary --input model.tm7
   tests/              # Unit tests
   SKILL.md            # Full reference — commands, options, format spec, examples
   _tmp/               # Scratch directory (git-ignored)
+tools/
+  tm7_validate.cs     # C# harness — validates TM7 via TMT's own deserializer
+  tm7_validate.csproj  # .NET project file (targets net48 / x86)
 ```
 
 ## Commands
@@ -56,6 +59,52 @@ cd .github/skills/threat-modeling
 python -m unittest discover -s tests -v
 ```
 
+## Validating TM7 files with TMT's deserializer
+
+`tools/tm7_validate.exe` uses Microsoft Threat Modeling Tool's own `DataContractSerializer` types to validate that a `.tm7` file can be deserialized — the same check TMT performs when opening a file.
+
+### Prerequisites
+
+- [.NET SDK](https://dotnet.microsoft.com/download) (any recent version that supports `net48` targeting)
+- Windows with .NET Framework 4.8 (ships with Windows 10/11)
+- [Microsoft Threat Modeling Tool](https://aka.ms/threatmodelingtool) installed (ClickOnce)
+
+### Building
+
+```cmd
+cd tools
+dotnet build -c Release
+```
+
+### Usage
+
+The tool auto-discovers the TMT ClickOnce install under `%LOCALAPPDATA%\Apps\2.0`.
+
+```cmd
+dotnet run --project tools -c Release -- file1.tm7 [file2.tm7 ...]
+```
+
+Or run the compiled exe directly:
+
+```cmd
+tools\bin\Release\net48\tm7_validate.exe file1.tm7 [file2.tm7 ...]
+```
+
+To override the auto-discovered path, set `TMT_DIR`:
+
+```cmd
+set TMT_DIR=C:\Users\you\AppData\Local\Apps\2.0\...\tmt7..tion_...
+```
+
+For each file the tool prints `OK` or `FAILED` with the deserialization error details. Exit code is the number of failures (0 = all passed).
+
 ## Further reading
 
 See [SKILL.md](.github/skills/threat-modeling/SKILL.md) for the full command reference, examples, and gotchas.
+
+## References
+
+Sample data:
+- https://github.com/matthiasrohr/OTMT
+  - [Simple Threat Model_https.tm7](https://github.com/matthiasrohr/OTMT/blob/master/Simple%20Threat%20Model_https.tm7)
+  - [Complex Threat Model_with_security_gateway.tm7](https://github.com/matthiasrohr/OTMT/blob/master/Complex%20Threat%20Model_with_security_gateway.tm7)
