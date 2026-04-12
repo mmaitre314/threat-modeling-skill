@@ -1,0 +1,3 @@
+# Prevent editors/formatters from modifying the TM7 template.
+# .NET DataContractSerializer is sensitive to whitespace inside text nodes.
+*.tm7 -text linguist-generated
