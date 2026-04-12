@@ -791,10 +791,62 @@ class MarkdownGenerator:
 # ---------------------------------------------------------------------------
 
 
+def _xml_escape(text: str) -> str:
+    """Escape text for safe embedding in XML character data."""
+    return (text.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;"))
+
+
+def _splice_section(text: str, tag: str, inner: str) -> str:
+    """Replace the content of the first ``<tag …>…</tag>`` (or ``<tag …/>``)."""
+
+    def _repl(m: re.Match) -> str:
+        opening = m.group(1)  # e.g. '<Borders xmlns:a="…"'
+        # Recover the closing tag name (may have a namespace prefix)
+        close_m = re.search(rf"</([a-zA-Z0-9_]*:?{tag})>\s*$", m.group(0))
+        close = close_m.group(1) if close_m else tag
+        return f"{opening}>{inner}</{close}>"
+
+    pattern = rf"(<(?:[a-zA-Z0-9_]+:)?{tag}(?:\s[^>]*)?)(?:/>|>.*?</(?:[a-zA-Z0-9_]+:)?{tag}>)"
+    return re.sub(pattern, _repl, text, count=1, flags=re.DOTALL)
+
+
+def _stencil_xml(guid: str, generic_type: str, type_id: str, name: str,
+                 height: int, left: int, top: int, width: int,
+                 stroke: int, NS: dict) -> str:
+    """Build a ``KeyValueOfguidanyType`` XML fragment for a stencil rectangle."""
+    return (
+        f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
+        f"<a:Key>{_xml_escape(guid)}</a:Key>"
+        f'<a:Value xmlns:i="{NS["i"]}" i:type="StencilRectangle">'
+        f'<GenericTypeId xmlns="{NS["abs"]}">{_xml_escape(generic_type)}</GenericTypeId>'
+        f'<Guid xmlns="{NS["abs"]}">{_xml_escape(guid)}</Guid>'
+        f'<Properties xmlns="{NS["abs"]}" xmlns:b="{NS["a"]}">'
+        f'<b:anyType i:type="c:StringDisplayAttribute" xmlns:c="{NS["kb"]}">'
+        f"<c:DisplayName>Name</c:DisplayName><c:Name />"
+        f'<c:Value i:type="d:string" xmlns:d="{NS["xs"]}">{_xml_escape(name)}</c:Value>'
+        f"</b:anyType></Properties>"
+        f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(type_id)}</TypeId>'
+        f'<Height xmlns="{NS["abs"]}">{height}</Height>'
+        f'<Left xmlns="{NS["abs"]}">{left}</Left>'
+        f'<StrokeThickness xmlns="{NS["abs"]}">{stroke}</StrokeThickness>'
+        f'<Top xmlns="{NS["abs"]}">{top}</Top>'
+        f'<Width xmlns="{NS["abs"]}">{width}</Width>'
+        f"</a:Value></a:KeyValueOfguidanyType>"
+    )
+
+
 class TM7Generator:
     """Generate a TM7 XML file from a ThreatModel.
 
     Optionally uses a template TM7 to preserve the KnowledgeBase section.
+
+    Because .NET DataContractSerializer embeds namespace-prefixed values inside
+    ``xsi:type`` attributes, round-tripping through Python's ElementTree
+    corrupts those references.  The ``write()`` / ``generate_text()`` methods
+    use raw-text splicing to avoid this problem when a template is available.
     """
 
     # Default template (empty TM7 created by TMT) shipped alongside this script
@@ -802,10 +854,12 @@ class TM7Generator:
 
     def __init__(self, template_path: Optional[str | Path] = None):
         self.template_tree = None
+        self._template_path: Optional[Path] = None
         path = template_path or (
             self._DEFAULT_TEMPLATE_PATH if self._DEFAULT_TEMPLATE_PATH.exists() else None
         )
         if path:
+            self._template_path = Path(path)
             self.template_tree = ET.parse(path)
 
     def generate(self, model: ThreatModel) -> ET.ElementTree:
@@ -819,6 +873,168 @@ class TM7Generator:
         self._set_threats(root, model)
 
         return ET.ElementTree(root)
+
+    # ------------------------------------------------------------------
+    # Template-safe output (raw-text splicing avoids namespace corruption)
+    # ------------------------------------------------------------------
+
+    def write(self, model: ThreatModel, output_path: str | Path) -> None:
+        """Write TM7 to *output_path*, using raw-text splicing when a template is available."""
+        Path(output_path).write_bytes(self.generate_text(model).encode("utf-8"))
+
+    def generate_text(self, model: ThreatModel) -> str:
+        """Return TM7 XML string, using raw-text splicing when a template is available."""
+        if self._template_path:
+            return self._generate_from_template(model)
+        tree = self.generate(model)
+        return ET.tostring(tree.getroot(), encoding="unicode")
+
+    def _generate_from_template(self, model: ThreatModel) -> str:
+        text = self._template_path.read_bytes().decode("utf-8")
+
+        # --- Metadata ---
+        meta_fields = {
+            "ThreatModelName": model.meta.name,
+            "Owner": model.meta.owner,
+            "Reviewer": model.meta.reviewer,
+            "HighLevelSystemDescription": model.meta.description,
+            "Assumptions": model.meta.assumptions,
+            "ExternalDependencies": model.meta.external_dependencies,
+            "Contributors": model.meta.contributors,
+        }
+        for tag, value in meta_fields.items():
+            text = re.sub(
+                rf"(<{tag}(?:\s[^>]*)?)(?:/>|>(.*?)</{tag}>)",
+                lambda m, t=tag, v=value: f"{m.group(1)}>{_xml_escape(v)}</{t}>",
+                text, count=1,
+            )
+
+        # --- Borders ---
+        text = _splice_section(text, "Borders", self._borders_xml(model))
+        # --- Lines ---
+        text = _splice_section(text, "Lines", self._lines_xml(model))
+        # --- ThreatInstances ---
+        ds_m = re.search(r"<Guid[^>]*>([0-9a-fA-F-]+)</Guid>", text)
+        ds_guid = ds_m.group(1) if ds_m else str(uuid.uuid4())
+        text = _splice_section(text, "ThreatInstances", self._threats_xml(model, ds_guid))
+
+        return text
+
+    # --- fragment builders (self-contained namespace declarations) ---
+
+    @staticmethod
+    def _borders_xml(model: ThreatModel) -> str:
+        if not model.elements and not model.boundaries:
+            return ""
+        NS = {
+            "a": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
+            "abs": "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts",
+            "kb": "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase",
+            "i": "http://www.w3.org/2001/XMLSchema-instance",
+            "xs": "http://www.w3.org/2001/XMLSchema",
+        }
+        parts: list[str] = []
+        x_pos = 50.0
+        for el in model.elements:
+            parts.append(_stencil_xml(el.guid, el.generic_type, el.type_id or el.generic_type,
+                                      el.name, int(el.height), int(x_pos), 100, int(el.width), 1, NS))
+            x_pos += 250.0
+        for tb in model.boundaries:
+            parts.append(_stencil_xml(tb.guid, tb.generic_type, tb.generic_type,
+                                      tb.name, 300, 10, 10, 800, 2, NS))
+        return "".join(parts)
+
+    @staticmethod
+    def _lines_xml(model: ThreatModel) -> str:
+        if not model.flows:
+            return ""
+        name_to_guid = {e.name: e.guid for e in model.elements}
+        NS = {
+            "a": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
+            "abs": "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts",
+            "kb": "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase",
+            "i": "http://www.w3.org/2001/XMLSchema-instance",
+            "xs": "http://www.w3.org/2001/XMLSchema",
+        }
+        parts: list[str] = []
+        for df in model.flows:
+            sg = name_to_guid.get(df.source_guid, df.source_guid)
+            tg = name_to_guid.get(df.target_guid, df.target_guid)
+            df.source_guid, df.target_guid = sg, tg
+            parts.append(
+                f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
+                f"<a:Key>{_xml_escape(df.guid)}</a:Key>"
+                f'<a:Value xmlns:i="{NS["i"]}" i:type="Connector">'
+                f'<GenericTypeId xmlns="{NS["abs"]}">{_xml_escape(df.generic_type)}</GenericTypeId>'
+                f'<Guid xmlns="{NS["abs"]}">{_xml_escape(df.guid)}</Guid>'
+                f'<Properties xmlns="{NS["abs"]}" xmlns:b="{NS["a"]}">'
+                f'<b:anyType i:type="c:StringDisplayAttribute" xmlns:c="{NS["kb"]}">'
+                f"<c:DisplayName>Name</c:DisplayName><c:Name />"
+                f'<c:Value i:type="d:string" xmlns:d="{NS["xs"]}">{_xml_escape(df.name)}</c:Value>'
+                f"</b:anyType></Properties>"
+                f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(df.type_id or "GE.DF")}</TypeId>'
+                f'<SourceGuid xmlns="{NS["abs"]}">{_xml_escape(sg)}</SourceGuid>'
+                f'<TargetGuid xmlns="{NS["abs"]}">{_xml_escape(tg)}</TargetGuid>'
+                f"</a:Value></a:KeyValueOfguidanyType>"
+            )
+        return "".join(parts)
+
+    @staticmethod
+    def _threats_xml(model: ThreatModel, ds_guid: str) -> str:
+        if not model.threats:
+            return ""
+        name_to_guid = {e.name: e.guid for e in model.elements}
+        flow_name_to_guid = {f.name: f.guid for f in model.flows}
+        now = datetime.now(timezone.utc).isoformat()
+        ns_a = "http://schemas.microsoft.com/2003/10/Serialization/Arrays"
+        ns_kb = "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase"
+        ns_i = "http://www.w3.org/2001/XMLSchema-instance"
+        parts: list[str] = []
+        for idx, t in enumerate(model.threats, 1):
+            sg = t.source_guid or name_to_guid.get(t.source, "")
+            tg = t.target_guid or name_to_guid.get(t.target, "")
+            fg = t.flow_guid or flow_name_to_guid.get(t.flow, "")
+            tid = t.id or str(idx)
+            ik = t.interaction_key or f"{sg}:{fg}:{tg}"
+            ck = f"{tid}{sg}{fg}{tg}"
+            cat = STRIDE_REVERSE.get(t.category, t.category)
+            sv = STATE_MAP_REVERSE.get(t.state, t.state)
+
+            def _kv(k: str, v: str) -> str:
+                return (f'<a:KeyValueOfstringstring xmlns:a="{ns_a}">'
+                        f"<a:Key>{_xml_escape(k)}</a:Key>"
+                        f"<a:Value>{_xml_escape(v)}</a:Value>"
+                        f"</a:KeyValueOfstringstring>")
+
+            p = [_kv("Title", t.title),
+                 _kv("UserThreatCategory", STRIDE_CATEGORIES.get(cat, t.category)),
+                 _kv("UserThreatDescription", t.description),
+                 _kv("Priority", t.priority),
+                 _kv("f9e02b87-2914-407e-bd11-97353ef43162", t.risk)]
+            if t.mitigation:
+                p.append(_kv("44490cdf-6399-4291-9bde-03dca6f03c11", t.mitigation))
+
+            parts.append(
+                f'<a:KeyValueOfstringThreatpc_P0_PhOB xmlns:a="{ns_a}">'
+                f"<a:Key>{_xml_escape(ck)}</a:Key>"
+                f'<a:Value xmlns:b="{ns_kb}">'
+                f"<b:ChangedBy>{_xml_escape(t.changed_by or 'AI Agent')}</b:ChangedBy>"
+                f"<b:DrawingSurfaceGuid>{_xml_escape(t.drawing_surface_guid or ds_guid)}</b:DrawingSurfaceGuid>"
+                f"<b:FlowGuid>{_xml_escape(fg)}</b:FlowGuid>"
+                f"<b:Id>{_xml_escape(tid)}</b:Id>"
+                f"<b:InteractionKey>{_xml_escape(ik)}</b:InteractionKey>"
+                f'<b:InteractionString xmlns:i="{ns_i}" i:nil="true" />'
+                f"<b:ModifiedAt>{_xml_escape(t.modified_at or now)}</b:ModifiedAt>"
+                f"<b:Priority>{_xml_escape(t.priority)}</b:Priority>"
+                f"<b:Properties>{''.join(p)}</b:Properties>"
+                f"<b:SourceGuid>{_xml_escape(sg)}</b:SourceGuid>"
+                f"<b:State>{_xml_escape(sv)}</b:State>"
+                f'<b:StateInformation xmlns:i="{ns_i}" i:nil="true" />'
+                f"<b:TargetGuid>{_xml_escape(tg)}</b:TargetGuid>"
+                f"<b:TypeId>{_xml_escape(t.threat_type_id or tid)}</b:TypeId>"
+                f"</a:Value></a:KeyValueOfstringThreatpc_P0_PhOB>"
+            )
+        return "".join(parts)
 
     def _create_skeleton(self) -> ET.Element:
         """Fallback skeleton when no template is available."""
@@ -854,47 +1070,35 @@ class TM7Generator:
         if ds_list is None:
             ds_list = ET.SubElement(root, _tag(NS_TM, "DrawingSurfaceList"))
 
-        # Clear existing surfaces and create new one
-        for child in list(ds_list):
-            ds_list.remove(child)
+        # Reuse existing DrawingSurfaceModel from template (preserves z:Id and
+        # other DataContract serialisation attributes), or create a new one.
+        ds = ds_list.find(_tag(NS_TM, "DrawingSurfaceModel"))
+        if ds is None:
+            ds = ET.SubElement(ds_list, _tag(NS_TM, "DrawingSurfaceModel"))
 
-        ds = ET.SubElement(ds_list, _tag(NS_TM, "DrawingSurfaceModel"))
-        ds_guid = str(uuid.uuid4())
+        ds_guid_el = ds.find(_tag(NS_ABS, "Guid"))
+        if ds_guid_el is not None:
+            ds_guid = ds_guid_el.text
+        else:
+            ds_guid = str(uuid.uuid4())
 
-        # GenericTypeId for surface
-        gt = ET.SubElement(ds, _tag(NS_ABS, "GenericTypeId"))
-        gt.text = "DRAWINGSURFACE"
-        guid_el = ET.SubElement(ds, _tag(NS_ABS, "Guid"))
-        guid_el.text = ds_guid
-
-        # Properties — TMT expects a Header and Name attribute
-        props = ET.SubElement(ds, _tag(NS_ABS, "Properties"))
-        hdr_attr = ET.SubElement(props, _tag(NS_ARR, "anyType"))
-        hdr_attr.set(f"{{{NS_XSI}}}type", "b:HeaderDisplayAttribute")
-        ET.SubElement(hdr_attr, _tag(NS_KB, "DisplayName")).text = "Diagram"
-        ET.SubElement(hdr_attr, _tag(NS_KB, "Name"))
-        val_nil = ET.SubElement(hdr_attr, _tag(NS_KB, "Value"))
-        val_nil.set(f"{{{NS_XSI}}}nil", "true")
-        self._add_string_prop(props, "Name", "Name", "Diagram 1")
-
-        type_id = ET.SubElement(ds, _tag(NS_ABS, "TypeId"))
-        type_id.text = "DRAWINGSURFACE"
-
-        # Borders (elements + trust boundaries)
-        borders = ET.SubElement(ds, _tag(NS_TM, "Borders"))
+        # Update Borders — clear and repopulate with model elements
+        borders = ds.find(_tag(NS_TM, "Borders"))
+        if borders is None:
+            borders = ET.SubElement(ds, _tag(NS_TM, "Borders"))
+        else:
+            for child in list(borders):
+                borders.remove(child)
         self._add_elements_to_borders(borders, model)
 
-        # Header
-        header = ET.SubElement(ds, _tag(NS_TM, "Header"))
-        header.text = "Diagram 1"
-
-        # Lines (data flows)
-        lines = ET.SubElement(ds, _tag(NS_TM, "Lines"))
+        # Update Lines — clear and repopulate with model flows
+        lines = ds.find(_tag(NS_TM, "Lines"))
+        if lines is None:
+            lines = ET.SubElement(ds, _tag(NS_TM, "Lines"))
+        else:
+            for child in list(lines):
+                lines.remove(child)
         self._add_flows_to_lines(lines, model)
-
-        # Zoom
-        zoom = ET.SubElement(ds, _tag(NS_TM, "Zoom"))
-        zoom.text = "1"
 
         # Store surface guid for threats
         model._drawing_surface_guid = ds_guid
@@ -1206,9 +1410,8 @@ def cmd_parse(args):
 def cmd_generate(args):
     model = MarkdownParser(args.input).parse()
     gen = TM7Generator(template_path=args.template)
-    tree = gen.generate(model)
     output = args.output or str(Path(args.input).with_suffix(".tm7"))
-    tree.write(output, encoding="utf-8", xml_declaration=False)
+    gen.write(model, output)
     print(f"Written to {output}")
 
 
