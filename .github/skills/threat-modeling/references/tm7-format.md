@@ -49,15 +49,29 @@ the file if any are missing.
 
 ## Element Types (GenericTypeId)
 
-| GenericTypeId | Description | Visual Shape |
-|---------------|-------------|--------------|
-| `GE.EI` | External Interactor | Rectangle |
-| `GE.P` | Process | Circle/Rounded Rectangle |
-| `GE.DS` | Data Store | Parallel lines |
-| `GE.DF` | Data Flow | Arrow/connector |
-| `GE.TB` | Trust Boundary (rectangular) | Dashed rectangle |
-| `GE.TB.L` | Trust Boundary (line) | Dashed line |
-| `DRAWINGSURFACE` | Drawing Surface | Container (the diagram page itself) |
+| GenericTypeId | Description | Visual Shape | `i:type` |
+|---------------|-------------|--------------|----------|
+| `GE.EI` | External Interactor | Rectangle | `StencilRectangle` |
+| `GE.P` | Process | Circle/Ellipse | `StencilEllipse` |
+| `GE.DS` | Data Store | Parallel lines | `StencilParallelLines` |
+| `GE.A` | Annotation | Rectangle (text note) | `StencilRectangle` |
+| `GE.DF` | Data Flow | Arrow/connector | `Connector` |
+| `GE.TB` | Trust Boundary (rectangular) | Dashed rectangle | — |
+| `GE.TB.L` | Trust Boundary (line) | Dashed line | `LineBoundary` |
+| `GE.TB.B` | Trust Boundary (box, generic) | Dashed rectangle | `BorderBoundary` |
+| `63e7829e-...` | Trust Boundary (box, typed) | Dashed rectangle | `BorderBoundary` |
+| `DRAWINGSURFACE` | Drawing Surface | Container (the diagram page itself) | — |
+
+> **BorderBoundary vs LineBoundary:** TMT has two visual forms for trust
+> boundaries.  *LineBoundary* is a dashed vertical/diagonal line stored in the
+> **Lines** section.  *BorderBoundary* is a dashed rectangle stored in the
+> **Borders** section with `GenericTypeId` =
+> `63e7829e-c420-4546-9336-0194c0113281` (the well-known GUID for the
+> "General Network" boundary family).  The parser must recognise both and
+> must **not** treat `BorderBoundary` entries as DFD elements.
+>
+> **Annotations** (`GE.A`) are freeform text notes placed on the diagram.
+> They should be skipped when building the element list.
 
 ## Common TypeIds
 
@@ -175,6 +189,46 @@ Each element has a `Properties` collection of typed attributes:
 | `44490cdf-6399-4291-9bde-03dca6f03c11` | Mitigation |
 | `bc9c6e2a-15d0-4863-9cac-589e51e4ca1e` | Priority |
 
+## Connector Coordinate Rules
+
+Each `Connector` (data flow) in the Lines section carries endpoint and
+handle coordinates that control the visual path of the arrow.
+
+### Direction-Aware Endpoints
+
+Connectors are direction-aware.  When the **source element is to the left**
+of the target, the arrow departs from the right edge of the source and
+arrives at the left edge of the target:
+
+| Field | Value | Ports |
+|-------|-------|-------|
+| SourceX | source.Left + source.Width (right edge) | PortSource = `East` |
+| SourceY | source.Top + source.Height / 2 (vertical centre) | |
+| TargetX | target.Left (left edge) | PortTarget = `West` |
+| TargetY | target.Top + target.Height / 2 (vertical centre) | |
+
+When the source is to the **right** of the target, the edges and ports
+are reversed (`West` → `East`).
+
+### Bidirectional Curve Offsets
+
+When two flows connect the same pair of elements in opposite directions
+(A→B and B→A), their arrows must bow in opposite directions so they
+don't overlap.  This is achieved by offsetting HandleY:
+
+- **First flow**: `HandleY = midpointY − OFFSET` (curves upward)
+- **Second flow**: `HandleY = midpointY + OFFSET` (curves downward)
+
+HandleX is always the horizontal midpoint between source and target.
+An offset of ~50 px produces visually distinct curves matching TMT's
+default layout.
+
+### LineBoundary Coordinates
+
+Trust boundary lines (type `LineBoundary`) are vertical lines spanning
+the element area.  SourceX ≈ TargetX, SourceY = top of area,
+TargetY = bottom of area.
+
 ## Serialization Gotchas
 
 TMT uses .NET **DataContractSerializer** which produces XML with several
@@ -186,6 +240,12 @@ DataContractSerializer emits `z:Id="i1"` attributes (namespace
 `http://schemas.microsoft.com/2003/10/Serialization/`) on objects it
 serializes.  `DrawingSurfaceModel` and `KnowledgeBase` carry these.
 Dropping or renumbering them causes deserialization failures.
+
+**Allocation scheme:** The default template uses `i1` and `i2`.  Generated
+elements use `i3` through `i(2 + N)` where N is the element count.  Flows
+and trust boundaries continue from `i(3 + N)` onward.  Each entry
+(**including each trust boundary**) must increment the counter to avoid
+duplicates.
 
 ### Namespace-Prefixed `xsi:type` Values
 
@@ -216,3 +276,11 @@ DataContractSerializer treats element text content literally — a
 load that whitespace as part of the model name.  Do not auto-format
 TM7 files.  The `references/` directory includes a `.gitattributes`
 marking `*.tm7` as binary to prevent this.
+
+### GUID Fields Must Never Be Empty
+
+All GUID-typed fields (`FlowGuid`, `SourceGuid`, `TargetGuid`,
+`DrawingSurfaceGuid`, etc.) must contain a valid GUID.  An empty string
+causes `FormatException: Unrecognized Guid format` during deserialization.
+When a GUID cannot be resolved, use the nil GUID
+`00000000-0000-0000-0000-000000000000`.

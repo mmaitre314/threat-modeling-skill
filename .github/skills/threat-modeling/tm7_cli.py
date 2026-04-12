@@ -49,6 +49,9 @@ def _tag(ns: str, local: str) -> str:
     return f"{{{ns}}}{local}"
 
 
+# Well-known GenericTypeId for BorderBoundary (box-shaped trust boundaries)
+_BORDER_BOUNDARY_GTYPE = "63e7829e-c420-4546-9336-0194c0113281"
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -230,9 +233,13 @@ class TM7Parser:
             val = kv.find(_tag(NS_ARR, "Value"))
             if val is None:
                 continue
+            gtype = self._child_text(val, NS_ABS, "GenericTypeId")
+            # Skip border boundaries (box trust boundaries) and annotations
+            if gtype == _BORDER_BOUNDARY_GTYPE or gtype == "GE.A":
+                continue
             el = Element()
             el.guid = self._child_text(val, NS_ABS, "Guid")
-            el.generic_type = self._child_text(val, NS_ABS, "GenericTypeId")
+            el.generic_type = gtype
             el.type_id = self._child_text(val, NS_ABS, "TypeId")
             el.x = float(self._child_text(val, NS_ABS, "Left") or "0")
             el.y = float(self._child_text(val, NS_ABS, "Top") or "0")
@@ -324,10 +331,16 @@ class TM7Parser:
             if val is None:
                 continue
             gtype = self._child_text(val, NS_ABS, "GenericTypeId")
-            if gtype and gtype.startswith("GE.TB"):
+            # Match both GE.TB.* (generic boundaries) and the well-known
+            # GUID for BorderBoundary (box-shaped trust boundaries)
+            is_boundary = (
+                (gtype and gtype.startswith("GE.TB"))
+                or gtype == _BORDER_BOUNDARY_GTYPE
+            )
+            if is_boundary:
                 tb = TrustBoundary()
                 tb.guid = self._child_text(val, NS_ABS, "Guid")
-                tb.generic_type = gtype
+                tb.generic_type = gtype if gtype.startswith("GE.TB") else "GE.TB.B"
                 props = val.find(_tag(NS_ABS, "Properties"))
                 if props is not None:
                     tb.name, _, _ = self._parse_props(props)
@@ -749,14 +762,19 @@ class MarkdownGenerator:
             for ename in tb.elements:
                 in_boundary.add(ename)
 
-        # Render boundaries as subgraphs
+        # Render boundaries as subgraphs with red dashed styling
+        tb_ids: list[str] = []
         for tb in model.boundaries:
-            lines.append(f'    subgraph "{tb.name}"')
+            sg_id = mid(tb.name)
+            tb_ids.append(sg_id)
+            lines.append(f'    subgraph {sg_id}["{tb.name}"]')
             for ename in tb.elements:
                 el = next((e for e in model.elements if e.name == ename), None)
                 if el:
                     lines.append(f"        {self._mermaid_node(el)}")
             lines.append("    end")
+        for sg_id in tb_ids:
+            lines.append(f"    style {sg_id} fill:transparent,stroke:red,stroke-width:2px,stroke-dasharray: 5 5,color:red")
 
         # Render elements not in any boundary
         for el in model.elements:
@@ -1012,6 +1030,13 @@ class TM7Generator:
         }
         parts: list[str] = []
         z_id = z_id_start
+
+        # Build a set of element-pair keys to detect bidirectional flows.
+        # For each pair (A,B), track which flows we've seen so we can offset
+        # the handle of the second flow in the opposite direction.
+        pair_seen: dict[tuple[str, str], int] = {}  # (min_guid, max_guid) -> count
+        CURVE_OFFSET = 50  # pixels above/below the straight line for curves
+
         for df in model.flows:
             sg = name_to_guid.get(df.source_guid, df.source_guid)
             tg = name_to_guid.get(df.target_guid, df.target_guid)
@@ -1019,17 +1044,37 @@ class TM7Generator:
             # Compute connector coordinates from element positions
             sx, sy, sw, sh = el_positions.get(sg, (0, 100, 100, 100))
             tx, ty, tw, th = el_positions.get(tg, (250, 100, 100, 100))
-            src_cx, src_cy = sx + sw // 2, sy + sh // 2
-            tgt_cx, tgt_cy = tx + tw // 2, ty + th // 2
-            # Source point: right edge of source element
-            source_x = sx + sw
-            source_y = src_cy
-            # Target point: left edge of target element
-            target_x = tx
-            target_y = tgt_cy
-            # Handle: midpoint of the connector line
+            src_cy = sy + sh // 2
+            tgt_cy = ty + th // 2
+            # Direction-aware: source-right→target-left when source is left
+            # of target, otherwise source-left→target-right.
+            if sx <= tx:
+                source_x = sx + sw   # right edge of source
+                source_y = src_cy
+                target_x = tx        # left edge of target
+                target_y = tgt_cy
+                port_source, port_target = "East", "West"
+            else:
+                source_x = sx        # left edge of source
+                source_y = src_cy
+                target_x = tx + tw   # right edge of target
+                target_y = tgt_cy
+                port_source, port_target = "West", "East"
+
+            # Handle: midpoint of the connector line, with vertical offset
+            # for bidirectional pairs so the curves bow in opposite directions.
             handle_x = (source_x + target_x) // 2
             handle_y = (source_y + target_y) // 2
+            pair_key = (min(sg, tg), max(sg, tg))
+            pair_idx = pair_seen.get(pair_key, 0)
+            pair_seen[pair_key] = pair_idx + 1
+            if pair_idx == 0:
+                # First flow in pair: curve upward
+                handle_y -= CURVE_OFFSET
+            else:
+                # Second flow in pair: curve downward
+                handle_y += CURVE_OFFSET
+
             parts.append(
                 f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
                 f"<a:Key>{_xml_escape(df.guid)}</a:Key>"
@@ -1044,8 +1089,8 @@ class TM7Generator:
                 f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(df.type_id or "GE.DF")}</TypeId>'
                 f'<HandleX xmlns="{NS["abs"]}">{handle_x}</HandleX>'
                 f'<HandleY xmlns="{NS["abs"]}">{handle_y}</HandleY>'
-                f'<PortSource xmlns="{NS["abs"]}">East</PortSource>'
-                f'<PortTarget xmlns="{NS["abs"]}">West</PortTarget>'
+                f'<PortSource xmlns="{NS["abs"]}">{port_source}</PortSource>'
+                f'<PortTarget xmlns="{NS["abs"]}">{port_target}</PortTarget>'
                 f'<SourceGuid xmlns="{NS["abs"]}">{_xml_escape(sg)}</SourceGuid>'
                 f'<SourceX xmlns="{NS["abs"]}">{source_x}</SourceX>'
                 f'<SourceY xmlns="{NS["abs"]}">{source_y}</SourceY>'
@@ -1074,6 +1119,7 @@ class TM7Generator:
                 tb.name, NS, z_id=f"i{z_id}",
                 source_x=tb_x, source_y=tb_min_y,
                 target_x=tb_x, target_y=tb_max_y))
+            z_id += 1
         return "".join(parts)
 
     @staticmethod
@@ -1087,10 +1133,11 @@ class TM7Generator:
         ns_kb = "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase"
         ns_i = "http://www.w3.org/2001/XMLSchema-instance"
         parts: list[str] = []
+        nil_guid = "00000000-0000-0000-0000-000000000000"
         for idx, t in enumerate(model.threats, 1):
-            sg = t.source_guid or name_to_guid.get(t.source, "")
-            tg = t.target_guid or name_to_guid.get(t.target, "")
-            fg = t.flow_guid or flow_name_to_guid.get(t.flow, "")
+            sg = t.source_guid or name_to_guid.get(t.source, nil_guid)
+            tg = t.target_guid or name_to_guid.get(t.target, nil_guid)
+            fg = t.flow_guid or flow_name_to_guid.get(t.flow, nil_guid)
             tid = t.id or str(idx)
             ik = t.interaction_key or f"{sg}:{fg}:{tg}"
             ck = f"{tid}{sg}{fg}{tg}"

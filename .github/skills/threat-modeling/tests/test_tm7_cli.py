@@ -29,6 +29,7 @@ from tm7_cli import (
     ThreatModel,
     ThreatModelMeta,
     TrustBoundary,
+    _BORDER_BOUNDARY_GTYPE,
     _splice_section,
     _xml_escape,
     generate_summary,
@@ -323,8 +324,12 @@ class TestMarkdownGenerator:
 
     def test_mermaid_has_subgraphs(self, sample_model: ThreatModel):
         md = MarkdownGenerator().generate(sample_model)
-        assert 'subgraph "Internet"' in md
-        assert 'subgraph "DMZ"' in md
+        assert 'subgraph ' in md
+        assert '["Internet"]' in md
+        assert '["DMZ"]' in md
+        # Trust boundaries should have red dashed styling
+        assert 'stroke:red' in md
+        assert 'stroke-dasharray' in md
 
     def test_mermaid_element_shapes(self, sample_model: ThreatModel):
         md = MarkdownGenerator().generate(sample_model)
@@ -932,3 +937,157 @@ class TestMappings:
     def test_state_map_reverse_is_inverse(self):
         for xml_val, display in STATE_MAP.items():
             assert STATE_MAP_REVERSE[display] == xml_val
+
+
+# ===================================================================
+# Connector Layout Tests
+# ===================================================================
+
+
+class TestConnectorLayout:
+    """Tests for direction-aware endpoints and bidirectional curve offsets."""
+
+    def _build_model_with_bidir_flows(self) -> ThreatModel:
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="BiDir")
+        a = Element(name="A", guid="aaaa", generic_type="GE.EI")
+        b = Element(name="B", guid="bbbb", generic_type="GE.P")
+        model.elements = [a, b]
+        model.flows = [
+            DataFlow(name="F1", guid="f1f1", source_guid="aaaa", target_guid="bbbb"),
+            DataFlow(name="F2", guid="f2f2", source_guid="bbbb", target_guid="aaaa"),
+        ]
+        return model
+
+    def test_bidirectional_flows_have_different_handle_y(self):
+        model = self._build_model_with_bidir_flows()
+        text = TM7Generator().generate_text(model)
+        # Extract HandleY values — there should be two with different Y
+        import re as _re
+        handles = _re.findall(r"<HandleY[^>]*>(\d+)</HandleY>", text)
+        assert len(handles) >= 2
+        assert handles[0] != handles[1], "Bidirectional flows must have different HandleY for curves"
+
+    def test_reverse_flow_uses_west_east_ports(self):
+        model = self._build_model_with_bidir_flows()
+        text = TM7Generator().generate_text(model)
+        # First flow (A→B, left-to-right) should use East→West
+        assert ">East</PortSource>" in text
+        assert ">West</PortTarget>" in text
+        # Second flow (B→A, right-to-left) should use West→East
+        assert ">West</PortSource>" in text
+        assert ">East</PortTarget>" in text
+
+    def test_single_flow_has_curve_offset(self):
+        """Even a single flow should have a handle offset (not on the straight line)."""
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Single")
+        a = Element(name="A", guid="aaaa", generic_type="GE.EI")
+        b = Element(name="B", guid="bbbb", generic_type="GE.P")
+        model.elements = [a, b]
+        model.flows = [
+            DataFlow(name="F1", guid="f1f1", source_guid="aaaa", target_guid="bbbb"),
+        ]
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        handle_y = _re.findall(r"<HandleY[^>]*>(\d+)</HandleY>", text)
+        source_y = _re.findall(r"<SourceY[^>]*>(\d+)</SourceY>", text)
+        assert len(handle_y) >= 1
+        assert len(source_y) >= 1
+        # Handle should be offset from the midpoint (curve upward for first flow)
+        assert int(handle_y[0]) != int(source_y[0])
+
+
+# ===================================================================
+# z:Id Uniqueness Tests
+# ===================================================================
+
+
+class TestZIdUniqueness:
+    def test_no_duplicate_zids(self, sample_model: ThreatModel):
+        text = TM7Generator().generate_text(sample_model)
+        import re as _re
+        ids = _re.findall(r'z:Id="(i\d+)"', text)
+        assert len(ids) == len(set(ids)), f"Duplicate z:Id values: {[x for x in ids if ids.count(x) > 1]}"
+
+    def test_many_boundaries_unique_zids(self):
+        """Multiple trust boundaries must each get a unique z:Id."""
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Multi TB")
+        a = Element(name="A", guid=str(uuid.uuid4()), generic_type="GE.P")
+        model.elements = [a]
+        model.boundaries = [
+            TrustBoundary(name="TB1", guid=str(uuid.uuid4()), elements=["A"]),
+            TrustBoundary(name="TB2", guid=str(uuid.uuid4())),
+            TrustBoundary(name="TB3", guid=str(uuid.uuid4())),
+        ]
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        ids = _re.findall(r'z:Id="(i\d+)"', text)
+        assert len(ids) == len(set(ids)), f"Duplicate z:Id values: {[x for x in ids if ids.count(x) > 1]}"
+
+
+# ===================================================================
+# Border Boundary / Annotation Filtering Tests
+# ===================================================================
+
+
+class TestBorderBoundaryFiltering:
+    """Ensure BorderBoundary and Annotation elements are not parsed as DFD elements."""
+
+    def test_border_boundary_constant_exists(self):
+        assert _BORDER_BOUNDARY_GTYPE == "63e7829e-c420-4546-9336-0194c0113281"
+
+    def test_border_boundary_excluded_from_elements(self, tmp_path: Path):
+        """An element with the BorderBoundary GenericTypeId should not appear in elements."""
+        # Use the simple_reference as a base (it has no border boundaries)
+        # and inject a border boundary entry in Borders via the complex_reference
+        samples = Path(__file__).resolve().parent.parent.parent.parent.parent / "samples"
+        complex_ref = samples / "complex_reference.tm7"
+        if not complex_ref.exists():
+            pytest.skip("complex_reference.tm7 not found")
+        model = TM7Parser(complex_ref).parse()
+        # Elements should not include any with the border boundary generic type
+        for el in model.elements:
+            assert el.generic_type != _BORDER_BOUNDARY_GTYPE, \
+                f"BorderBoundary '{el.name}' leaked into elements"
+            assert el.generic_type != "GE.A", \
+                f"Annotation '{el.name}' leaked into elements"
+
+    def test_border_boundary_parsed_as_trust_boundary(self, tmp_path: Path):
+        samples = Path(__file__).resolve().parent.parent.parent.parent.parent / "samples"
+        complex_ref = samples / "complex_reference.tm7"
+        if not complex_ref.exists():
+            pytest.skip("complex_reference.tm7 not found")
+        model = TM7Parser(complex_ref).parse()
+        tb_names = {tb.name for tb in model.boundaries}
+        # Internet DMZ and Shared are BorderBoundary types in the reference
+        assert "Internet DMZ" in tb_names
+        assert "Shared" in tb_names
+
+
+# ===================================================================
+# Nil GUID Fallback Tests
+# ===================================================================
+
+
+class TestNilGuidFallback:
+    def test_unresolvable_threat_guids_use_nil(self):
+        """Threats with unresolvable source/target/flow should use nil GUID, not empty string."""
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Nil GUID")
+        model.elements = [Element(name="A", guid=str(uuid.uuid4()), generic_type="GE.P")]
+        model.threats = [
+            Threat(id="1", title="Orphan", category="Tampering", state="Needs Investigation",
+                   priority="High", risk="High", description="No matching element",
+                   source="NonExistent", target="AlsoMissing", flow="NoSuchFlow"),
+        ]
+        text = TM7Generator().generate_text(model)
+        nil = "00000000-0000-0000-0000-000000000000"
+        assert f"<b:FlowGuid>{nil}</b:FlowGuid>" in text
+        assert f"<b:SourceGuid>{nil}</b:SourceGuid>" in text
+        assert f"<b:TargetGuid>{nil}</b:TargetGuid>" in text
+        # Must NOT contain empty GUID fields
+        assert "<b:FlowGuid></b:FlowGuid>" not in text
+        assert "<b:SourceGuid></b:SourceGuid>" not in text
+        assert "<b:TargetGuid></b:TargetGuid>" not in text
