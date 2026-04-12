@@ -797,10 +797,16 @@ class TM7Generator:
     Optionally uses a template TM7 to preserve the KnowledgeBase section.
     """
 
+    # Default template (empty TM7 created by TMT) shipped alongside this script
+    _DEFAULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "references" / "default_template.tm7"
+
     def __init__(self, template_path: Optional[str | Path] = None):
         self.template_tree = None
-        if template_path:
-            self.template_tree = ET.parse(template_path)
+        path = template_path or (
+            self._DEFAULT_TEMPLATE_PATH if self._DEFAULT_TEMPLATE_PATH.exists() else None
+        )
+        if path:
+            self.template_tree = ET.parse(path)
 
     def generate(self, model: ThreatModel) -> ET.ElementTree:
         if self.template_tree:
@@ -815,6 +821,7 @@ class TM7Generator:
         return ET.ElementTree(root)
 
     def _create_skeleton(self) -> ET.Element:
+        """Fallback skeleton when no template is available."""
         root = ET.Element(_tag(NS_TM, "ThreatModel"))
         ET.SubElement(root, _tag(NS_TM, "DrawingSurfaceList"))
         ET.SubElement(root, _tag(NS_TM, "MetaInformation"))
@@ -825,6 +832,8 @@ class TM7Generator:
         ET.SubElement(root, _tag(NS_TM, "Validations"))
         ver = ET.SubElement(root, _tag(NS_TM, "Version"))
         ver.text = "2.0"
+        profile = ET.SubElement(root, _tag(NS_TM, "Profile"))
+        ET.SubElement(profile, _tag(NS_TM, "PromptedKb"))
         return root
 
     def _set_meta(self, root: ET.Element, meta: ThreatModelMeta):
@@ -854,12 +863,22 @@ class TM7Generator:
 
         # GenericTypeId for surface
         gt = ET.SubElement(ds, _tag(NS_ABS, "GenericTypeId"))
-        gt.text = "GE.S"
+        gt.text = "DRAWINGSURFACE"
         guid_el = ET.SubElement(ds, _tag(NS_ABS, "Guid"))
         guid_el.text = ds_guid
+
+        # Properties — TMT expects a Header and Name attribute
         props = ET.SubElement(ds, _tag(NS_ABS, "Properties"))
+        hdr_attr = ET.SubElement(props, _tag(NS_ARR, "anyType"))
+        hdr_attr.set(f"{{{NS_XSI}}}type", "b:HeaderDisplayAttribute")
+        ET.SubElement(hdr_attr, _tag(NS_KB, "DisplayName")).text = "Diagram"
+        ET.SubElement(hdr_attr, _tag(NS_KB, "Name"))
+        val_nil = ET.SubElement(hdr_attr, _tag(NS_KB, "Value"))
+        val_nil.set(f"{{{NS_XSI}}}nil", "true")
+        self._add_string_prop(props, "Name", "Name", "Diagram 1")
+
         type_id = ET.SubElement(ds, _tag(NS_ABS, "TypeId"))
-        type_id.text = "GE.S"
+        type_id.text = "DRAWINGSURFACE"
 
         # Borders (elements + trust boundaries)
         borders = ET.SubElement(ds, _tag(NS_TM, "Borders"))
@@ -867,7 +886,7 @@ class TM7Generator:
 
         # Header
         header = ET.SubElement(ds, _tag(NS_TM, "Header"))
-        header.text = model.meta.name or "Threat Model"
+        header.text = "Diagram 1"
 
         # Lines (data flows)
         lines = ET.SubElement(ds, _tag(NS_TM, "Lines"))
@@ -875,7 +894,7 @@ class TM7Generator:
 
         # Zoom
         zoom = ET.SubElement(ds, _tag(NS_TM, "Zoom"))
-        zoom.text = "100"
+        zoom.text = "1"
 
         # Store surface guid for threats
         model._drawing_surface_guid = ds_guid
@@ -1189,7 +1208,7 @@ def cmd_generate(args):
     gen = TM7Generator(template_path=args.template)
     tree = gen.generate(model)
     output = args.output or str(Path(args.input).with_suffix(".tm7"))
-    tree.write(output, encoding="unicode", xml_declaration=True)
+    tree.write(output, encoding="utf-8", xml_declaration=False)
     print(f"Written to {output}")
 
 

@@ -452,7 +452,27 @@ class TestTM7Generator:
         out = tmp_path / "out.tm7"
         tree.write(str(out), encoding="unicode", xml_declaration=True)
         text = out.read_text(encoding="utf-8")
-        assert "2.0" in text
+        assert "<Version>" in text
+
+    def test_skeleton_has_knowledgebase(self, sample_model: ThreatModel):
+        gen = TM7Generator()
+        tree = gen.generate(sample_model)
+        root = tree.getroot()
+        ns = "http://schemas.datacontract.org/2004/07/ThreatModeling.Model"
+        kb = root.find(f"{{{ns}}}KnowledgeBase")
+        assert kb is not None, "Generated TM7 must contain a KnowledgeBase element"
+        # KB must have GenericElements and ThreatCategories at minimum
+        ns_kb = "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase"
+        assert kb.find(f"{{{ns_kb}}}GenericElements") is not None
+        assert kb.find(f"{{{ns_kb}}}ThreatCategories") is not None
+
+    def test_skeleton_has_profile(self, sample_model: ThreatModel):
+        gen = TM7Generator()
+        tree = gen.generate(sample_model)
+        root = tree.getroot()
+        ns = "http://schemas.datacontract.org/2004/07/ThreatModeling.Model"
+        profile = root.find(f"{{{ns}}}Profile")
+        assert profile is not None, "Generated TM7 must contain a Profile element"
 
 
 # ===================================================================
