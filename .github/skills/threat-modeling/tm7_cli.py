@@ -353,6 +353,9 @@ class TM7Parser:
                     diag.elements.append(el)
                     stencil_rects.append((el.name, x, y, w, h))
 
+        # Sort elements by X coordinate for readable left-to-right order
+        diag.elements.sort(key=lambda e: e.x)
+
         # Geometric containment for border boundaries
         for tb, bx, by, bw, bh in boundary_entries:
             for el_name, ex, ey, ew, eh in stencil_rects:
@@ -880,8 +883,17 @@ class MarkdownGenerator:
             if el.name not in in_boundary:
                 lines.append(f"    {self._mermaid_node(el)}")
 
-        # Render flows
-        for df in flows:
+        # Render flows – sort so forward (left-to-right) edges come first
+        # to guide Mermaid's graph LR rank assignment.
+        el_order = {e.name: i for i, e in enumerate(elements)}
+        def _flow_sort_key(df):
+            sn = guid_to_name.get(df.source_guid, df.source_guid)
+            tn = guid_to_name.get(df.target_guid, df.target_guid)
+            si, ti = el_order.get(sn, 999), el_order.get(tn, 999)
+            forward = 0 if si <= ti else 1
+            return (min(si, ti), forward, df.name)
+
+        for df in sorted(flows, key=_flow_sort_key):
             src_name = guid_to_name.get(df.source_guid, df.source_guid)
             tgt_name = guid_to_name.get(df.target_guid, df.target_guid)
             src_id = mid(src_name)
