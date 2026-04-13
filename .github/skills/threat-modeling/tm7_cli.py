@@ -1157,6 +1157,47 @@ class TM7Generator:
         ds_guid = ds_m.group(1) if ds_m else str(uuid.uuid4())
         text = _splice_section(text, "ThreatInstances", self._threats_xml(model, ds_guid))
 
+        # --- KB StandardElement entries for border boundaries ---
+        # TMT resolves BorderBoundary TypeId → StandardElement for StencilName.
+        # Without a matching entry, TMT crashes with NullReferenceException.
+        bb_guids = set()
+        for diag in diagrams:
+            for tb in diag.boundaries:
+                if tb.elements:  # only populated boundaries are BorderBoundary
+                    bb_guids.add((tb.guid, tb.name))
+        if bb_guids:
+            ns_kb = "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase"
+            ns_ext = "http://schemas.datacontract.org/2004/07/ThreatModeling.ExternalStorage.OM"
+            ns_i = "http://www.w3.org/2001/XMLSchema-instance"
+            se_entries: list[str] = []
+            for guid, name in bb_guids:
+                se_entries.append(
+                    f'<a:ElementType xmlns:a="{ns_kb}">'
+                    f"<a:Attributes/>"
+                    f'<a:AvailableToBaseModels xmlns:b="{ns_ext}"/>'
+                    f'<a:Behavior i:nil="true" xmlns:i="{ns_i}"/>'
+                    f"<a:Description/>"
+                    f"<a:Hidden>false</a:Hidden>"
+                    f"<a:Id>{_xml_escape(guid)}</a:Id>"
+                    f"<a:ImageLocation/>"
+                    f"<a:ImageSource/>"
+                    f'<a:ImageStream i:nil="true" xmlns:i="{ns_i}"/>'
+                    f"<a:Name>{_xml_escape(name)}</a:Name>"
+                    f"<a:ParentId>{_BORDER_BOUNDARY_GTYPE}</a:ParentId>"
+                    f"<a:Representation>BorderBoundary</a:Representation>"
+                    f"<a:Shape/>"
+                    f"<a:StrokeDashArray>1</a:StrokeDashArray>"
+                    f"<a:StrokeThickness>1</a:StrokeThickness>"
+                    f"</a:ElementType>"
+                )
+            # Append entries to the existing StandardElements content.
+            # The tag may or may not have a namespace prefix.
+            for close_pattern in ("</StandardElements>", "</a:StandardElements>"):
+                se_pos = text.find(close_pattern)
+                if se_pos >= 0:
+                    text = text[:se_pos] + "".join(se_entries) + text[se_pos:]
+                    break
+
         return text
 
     @staticmethod
@@ -1290,8 +1331,9 @@ class TM7Generator:
         tb_by_name = {tb.name: tb for tb in boundaries}
         for bname, (bl, bt, bw, bh) in boundary_rects.items():
             tb = tb_by_name[bname]
+            # TypeId = tb.guid so it matches the StandardElement entry we add to KB
             parts.append(_border_boundary_xml(
-                tb.guid, _BORDER_BOUNDARY_GTYPE,
+                tb.guid, tb.guid,
                 bname, bh, bl, bt, bw, NS,
                 z_id=f"i{z_id}"))
             z_id += 1

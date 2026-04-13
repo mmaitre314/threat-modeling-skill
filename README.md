@@ -2,7 +2,11 @@
 
 Generate, review, and maintain threat models compatible with the [Microsoft Threat Modeling Tool](https://learn.microsoft.com/en-us/azure/security/develop/threat-modeling-tool) (.tm7 format). Designed as a [GitHub Copilot skill](https://code.visualstudio.com/docs/copilot/chat/chat-agent-mode#_custom-instructions) so AI agents can interact with threat models programmatically.
 
-The AI skill uses an intermediate file format with [Markdown](https://daringfireball.net/projects/markdown/) + [Mermaid](https://github.com/mermaid-js/mermaid) for readability.
+<p align="center"><img alt="Azure VM Threat Model - TM7" src="media/azure-vm-tm7.png" width="60%"></p>
+
+The AI skill uses an intermediate file format with [Markdown](https://daringfireball.net/projects/markdown/) + [Mermaid](https://github.com/mermaid-js/mermaid) for readability (ex: [samples/azure-vm.md](samples/azure-vm.md)).
+
+<p align="center"><img alt="Azure VM Threat Model - Markdown" src="media/azure-vm-md.png" width="60%"></p>
 
 ## Quick start
 
