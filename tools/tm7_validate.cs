@@ -274,9 +274,12 @@ class Program
             var typeId = typeIdNodes[i].InnerText.Trim();
             if (!string.IsNullOrEmpty(typeId) && knownTypeIds.Count > 0 && !knownTypeIds.Contains(typeId))
             {
+                // Skip if TypeId matches GenericTypeId (base type self-reference, e.g. BorderBoundary)
+                var genericId = GetText(parent, "GenericTypeId", nsMgr);
+                if (typeId == genericId) continue;
+
                 var nameNode = parent.SelectSingleNode("abs:Properties//kb:Value", nsMgr);
                 var elName = nameNode != null ? nameNode.InnerText.Trim() : "(unnamed)";
-                var genericId = GetText(parent, "GenericTypeId", nsMgr);
                 warnings.Add("Unable to resolve type '" + typeId + "' for '" + elName + "', reverted to base generic type '" + genericId + "'");
             }
         }

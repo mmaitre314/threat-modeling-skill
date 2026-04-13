@@ -977,6 +977,37 @@ def _stencil_xml(guid: str, generic_type: str, type_id: str, name: str,
     )
 
 
+def _border_boundary_xml(guid: str, type_id: str, name: str,
+                         height: int, left: int, top: int, width: int,
+                         NS: dict, z_id: str = "") -> str:
+    """Build a ``KeyValueOfguidanyType`` XML fragment for a BorderBoundary (box)."""
+    zattr = f' z:Id="{z_id}" xmlns:z="http://schemas.microsoft.com/2003/10/Serialization/"' if z_id else ""
+    return (
+        f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
+        f"<a:Key>{_xml_escape(guid)}</a:Key>"
+        f'<a:Value{zattr} xmlns:i="{NS["i"]}" i:type="BorderBoundary">'
+        f'<GenericTypeId xmlns="{NS["abs"]}">{_BORDER_BOUNDARY_GTYPE}</GenericTypeId>'
+        f'<Guid xmlns="{NS["abs"]}">{_xml_escape(guid)}</Guid>'
+        f'<Properties xmlns="{NS["abs"]}" xmlns:b="{NS["a"]}">'
+        f'<b:anyType i:type="c:HeaderDisplayAttribute" xmlns:c="{NS["kb"]}">'
+        f"<c:DisplayName>{_xml_escape(name)}</c:DisplayName><c:Name />"
+        f'<c:Value i:nil="true"/>'
+        f"</b:anyType>"
+        f'<b:anyType i:type="c:StringDisplayAttribute" xmlns:c="{NS["kb"]}">'
+        f"<c:DisplayName>Name</c:DisplayName><c:Name />"
+        f'<c:Value i:type="d:string" xmlns:d="{NS["xs"]}">{_xml_escape(name)}</c:Value>'
+        f"</b:anyType></Properties>"
+        f'<TypeId xmlns="{NS["abs"]}">{_xml_escape(type_id)}</TypeId>'
+        f'<Height xmlns="{NS["abs"]}">{height}</Height>'
+        f'<Left xmlns="{NS["abs"]}">{left}</Left>'
+        f'<StrokeDashArray xmlns="{NS["abs"]}">1</StrokeDashArray>'
+        f'<StrokeThickness xmlns="{NS["abs"]}">1</StrokeThickness>'
+        f'<Top xmlns="{NS["abs"]}">{top}</Top>'
+        f'<Width xmlns="{NS["abs"]}">{width}</Width>'
+        f"</a:Value></a:KeyValueOfguidanyType>"
+    )
+
+
 def _line_boundary_xml(guid: str, generic_type: str, type_id: str, name: str,
                        NS: dict, z_id: str = "",
                        source_x: int = 297, source_y: int = 10,
@@ -1093,13 +1124,13 @@ class TM7Generator:
         if len(diagrams) <= 1:
             # Single diagram: splice into the existing DrawingSurfaceModel
             diag = diagrams[0]
-            borders_xml, el_positions = self._borders_xml(diag.elements, z_id_start=z_start)
+            borders_xml, el_positions, next_z = self._borders_xml(
+                diag.elements, z_id_start=z_start, boundaries=diag.boundaries)
             text = _splice_section(text, "Borders", borders_xml)
-            lines_z_start = z_start + len(diag.elements)
             text = _splice_section(text, "Lines",
                                    self._lines_xml(diag.elements, diag.flows,
                                                    diag.boundaries, el_positions,
-                                                   z_id_start=lines_z_start))
+                                                   z_id_start=next_z))
             if diag.name:
                 text = _splice_section(text, "Header", _xml_escape(diag.name))
         else:
@@ -1110,12 +1141,14 @@ class TM7Generator:
             for i, diag in enumerate(diagrams):
                 dsm_z_id = f"i{z_id}"
                 z_id += 1
-                borders_xml, el_positions = self._borders_xml(diag.elements, z_id_start=z_id)
-                z_id += len(diag.elements)
+                borders_xml, el_positions, z_id = self._borders_xml(
+                    diag.elements, z_id_start=z_id, boundaries=diag.boundaries)
                 lines_xml = self._lines_xml(diag.elements, diag.flows,
                                             diag.boundaries, el_positions,
                                             z_id_start=z_id)
-                z_id += len(diag.flows) + len(diag.boundaries)
+                # Count line items: flows + empty boundaries only
+                empty_tb = sum(1 for tb in diag.boundaries if not tb.elements)
+                z_id += len(diag.flows) + empty_tb
                 dsm_parts.append(self._dsm_xml(diag, dsm_z_id, borders_xml, lines_xml))
             text = _splice_section(text, "DrawingSurfaceList", "".join(dsm_parts))
 
@@ -1157,10 +1190,17 @@ class TM7Generator:
     # --- fragment builders (self-contained namespace declarations) ---
 
     @staticmethod
-    def _borders_xml(elements: list[Element], z_id_start: int = 3) -> tuple[str, dict]:
-        """Return (xml_fragment, {guid: (left, top, width, height)})."""
-        if not elements:
-            return "", {}
+    def _borders_xml(elements: list[Element], z_id_start: int = 3,
+                     boundaries: list['TrustBoundary'] | None = None) -> tuple[str, dict, int]:
+        """Return (xml_fragment, {guid: (left, top, width, height)}, next_z_id).
+
+        Elements are laid out in columns grouped by trust boundary membership.
+        Boundaries with elements are emitted as BorderBoundary boxes that
+        geometrically contain their member elements.
+        """
+        if not elements and not boundaries:
+            return "", {}, z_id_start
+        boundaries = boundaries or []
         NS = {
             "a": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
             "abs": "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts",
@@ -1168,22 +1208,95 @@ class TM7Generator:
             "i": "http://www.w3.org/2001/XMLSchema-instance",
             "xs": "http://www.w3.org/2001/XMLSchema",
         }
+
+        # --- Group elements by boundary membership ---
+        in_boundary: dict[str, str] = {}  # element name -> boundary name
+        for tb in boundaries:
+            for ename in tb.elements:
+                in_boundary[ename] = tb.name
+
+        # Ordered groups: first boundaries (in order), then ungrouped
+        groups: list[tuple[str | None, list[Element]]] = []
+        ungrouped: list[Element] = []
+        tb_groups: dict[str, list[Element]] = {tb.name: [] for tb in boundaries if tb.elements}
+        for el in elements:
+            bname = in_boundary.get(el.name)
+            if bname and bname in tb_groups:
+                tb_groups[bname].append(el)
+            else:
+                ungrouped.append(el)
+
+        # Ungrouped first (leftmost), then boundary groups in order
+        if ungrouped:
+            groups.append((None, ungrouped))
+        for tb in boundaries:
+            if tb.elements and tb.name in tb_groups and tb_groups[tb.name]:
+                groups.append((tb.name, tb_groups[tb.name]))
+
+        # --- 2D layout: bounded groups are vertical columns,
+        #     ungrouped elements spread horizontally ---
+        PAD = 30       # padding inside border boundary box
+        COL_GAP = 100  # gap between columns
+        ROW_GAP = 30   # gap between elements within a column
+        START_X = 50
+        START_Y = 50
+
         parts: list[str] = []
         positions: dict[str, tuple[int, int, int, int]] = {}
-        x_pos = 50.0
+        boundary_rects: dict[str, tuple[int, int, int, int]] = {}  # name -> (l,t,w,h)
         z_id = z_id_start
-        for el in elements:
-            left = int(x_pos)
-            top = 100
-            w = int(el.width)
-            h = int(el.height)
-            parts.append(_stencil_xml(el.guid, el.generic_type, el.type_id or el.generic_type,
-                                      el.name, h, left, top, w, 1, NS,
-                                      z_id=f"i{z_id}"))
-            positions[el.guid] = (left, top, w, h)
-            x_pos += 250.0
+        x_cursor = START_X
+
+        for group_name, group_els in groups:
+            has_boundary = group_name is not None
+
+            if has_boundary:
+                # Bounded group: stack elements vertically inside the box
+                col_x = x_cursor + PAD
+                col_y = START_Y + PAD
+                max_w = 0
+                y_cursor = col_y
+                for el in group_els:
+                    w = int(el.width) if el.width else 100
+                    h = int(el.height) if el.height else 100
+                    parts.append(_stencil_xml(el.guid, el.generic_type,
+                                              el.type_id or el.generic_type,
+                                              el.name, h, col_x, y_cursor, w, 1, NS,
+                                              z_id=f"i{z_id}"))
+                    positions[el.guid] = (col_x, y_cursor, w, h)
+                    max_w = max(max_w, w)
+                    y_cursor += h + ROW_GAP
+                    z_id += 1
+                box_left = x_cursor
+                box_top = START_Y
+                box_width = max_w + 2 * PAD
+                box_height = (y_cursor - ROW_GAP) - START_Y + PAD
+                boundary_rects[group_name] = (box_left, box_top, box_width, box_height)
+                x_cursor = box_left + box_width + COL_GAP
+            else:
+                # Ungrouped elements: lay out horizontally at the same Y level
+                for el in group_els:
+                    w = int(el.width) if el.width else 100
+                    h = int(el.height) if el.height else 100
+                    parts.append(_stencil_xml(el.guid, el.generic_type,
+                                              el.type_id or el.generic_type,
+                                              el.name, h, x_cursor, START_Y, w, 1, NS,
+                                              z_id=f"i{z_id}"))
+                    positions[el.guid] = (x_cursor, START_Y, w, h)
+                    x_cursor += w + COL_GAP
+                    z_id += 1
+
+        # Emit border boundaries
+        tb_by_name = {tb.name: tb for tb in boundaries}
+        for bname, (bl, bt, bw, bh) in boundary_rects.items():
+            tb = tb_by_name[bname]
+            parts.append(_border_boundary_xml(
+                tb.guid, _BORDER_BOUNDARY_GTYPE,
+                bname, bh, bl, bt, bw, NS,
+                z_id=f"i{z_id}"))
             z_id += 1
-        return "".join(parts), positions
+
+        return "".join(parts), positions, z_id
 
     @staticmethod
     def _lines_xml(elements: list[Element], flows: list[DataFlow],
@@ -1271,7 +1384,9 @@ class TM7Generator:
                 f"</a:Value></a:KeyValueOfguidanyType>"
             )
             z_id += 1
-        # Trust boundaries as LineBoundary entries — vertical line spanning elements
+        # Trust boundaries as LineBoundary entries — only for boundaries
+        # without elements (populated boundaries are emitted as BorderBoundary
+        # in Borders).
         if el_positions:
             all_tops = [t for _, t, _, _ in el_positions.values()]
             all_bottoms = [t + h for _, t, _, h in el_positions.values()]
@@ -1281,6 +1396,8 @@ class TM7Generator:
             tb_min_y, tb_max_y = 10, 306
         tb_x_offset = 0
         for tb in boundaries:
+            if tb.elements:
+                continue  # already in Borders as BorderBoundary
             tb_generic = "GE.TB.L" if tb.generic_type == "GE.TB" else tb.generic_type
             # Place boundary line between elements; shift each boundary right
             tb_x = 270 + tb_x_offset

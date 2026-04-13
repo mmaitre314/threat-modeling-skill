@@ -108,3 +108,4 @@ Sample data:
 - https://github.com/matthiasrohr/OTMT
   - [Simple Threat Model_https.tm7](https://github.com/matthiasrohr/OTMT/blob/master/Simple%20Threat%20Model_https.tm7)
   - [Complex Threat Model_with_security_gateway.tm7](https://github.com/matthiasrohr/OTMT/blob/master/Complex%20Threat%20Model_with_security_gateway.tm7)
+- [Azure VM Bicep](https://github.com/Azure/azure-quickstart-templates/blob/master/quickstarts/microsoft.compute/vm-simple-windows/main.bicep)
