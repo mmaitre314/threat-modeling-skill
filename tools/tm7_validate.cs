@@ -281,6 +281,100 @@ class Program
             }
         }
 
+        // Phase 3: DrawingSurfaceModel consistency checks
+        var dsmNodes = doc.SelectNodes("//tm:DrawingSurfaceModel", nsMgr);
+        if (dsmNodes != null)
+        {
+            var allDsmGuids = new HashSet<string>();
+            foreach (XmlNode dsm in dsmNodes)
+            {
+                var dsmGuid = GetText(dsm, "Guid", nsMgr);
+                if (!string.IsNullOrEmpty(dsmGuid))
+                    allDsmGuids.Add(dsmGuid);
+
+                // Check required child elements exist
+                var genericTypeId = GetText(dsm, "GenericTypeId", nsMgr);
+                if (string.IsNullOrEmpty(genericTypeId))
+                    warnings.Add("DrawingSurfaceModel missing GenericTypeId");
+                else if (genericTypeId != "DRAWINGSURFACE")
+                    warnings.Add("DrawingSurfaceModel GenericTypeId is '" + genericTypeId + "', expected 'DRAWINGSURFACE'");
+
+                var typeId = GetText(dsm, "TypeId", nsMgr);
+                if (string.IsNullOrEmpty(typeId))
+                    warnings.Add("DrawingSurfaceModel missing TypeId");
+
+                // Check Header exists
+                var header = dsm.SelectSingleNode("tm:Header", nsMgr);
+                if (header == null)
+                    warnings.Add("DrawingSurfaceModel missing Header element");
+
+                // Check Borders exists
+                var borders = dsm.SelectSingleNode("tm:Borders", nsMgr);
+                if (borders == null)
+                    warnings.Add("DrawingSurfaceModel missing Borders element");
+
+                // Check Lines exists
+                var lines = dsm.SelectSingleNode("tm:Lines", nsMgr);
+                if (lines == null)
+                    warnings.Add("DrawingSurfaceModel missing Lines element");
+
+                // Check Zoom exists
+                var zoom = dsm.SelectSingleNode("tm:Zoom", nsMgr);
+                if (zoom == null)
+                    warnings.Add("DrawingSurfaceModel missing Zoom element");
+
+                // Collect element GUIDs from this DSM's Borders
+                var elementGuids = new HashSet<string>();
+                if (borders != null)
+                {
+                    foreach (XmlNode kv in borders.ChildNodes)
+                    {
+                        var val2 = kv.SelectSingleNode("a:Value", nsMgr);
+                        if (val2 == null) continue;
+                        var guid2 = GetText(val2, "Guid", nsMgr);
+                        if (!string.IsNullOrEmpty(guid2))
+                            elementGuids.Add(guid2);
+                    }
+                }
+
+                // Check that Connectors reference elements in same DSM
+                if (lines != null)
+                {
+                    foreach (XmlNode kv in lines.ChildNodes)
+                    {
+                        var val2 = kv.SelectSingleNode("a:Value", nsMgr);
+                        if (val2 == null) continue;
+                        var typeAttr3 = (val2 is XmlElement v2El) ? v2El.GetAttributeNode("type", "http://www.w3.org/2001/XMLSchema-instance") : null;
+                        var lineType2 = typeAttr3 != null ? typeAttr3.Value : "";
+                        if (!lineType2.Contains("Connector")) continue;
+
+                        var nameNode2 = val2.SelectSingleNode("abs:Properties//kb:Value", nsMgr);
+                        var elName2 = nameNode2 != null ? nameNode2.InnerText.Trim() : "(unnamed)";
+                        var srcGuid = GetText(val2, "SourceGuid", nsMgr);
+                        var tgtGuid = GetText(val2, "TargetGuid", nsMgr);
+                        var nilG = "00000000-0000-0000-0000-000000000000";
+
+                        if (!string.IsNullOrEmpty(srcGuid) && srcGuid != nilG && !elementGuids.Contains(srcGuid))
+                            warnings.Add("Connector '" + elName2 + "' SourceGuid " + srcGuid + " not in same diagram's Borders");
+                        if (!string.IsNullOrEmpty(tgtGuid) && tgtGuid != nilG && !elementGuids.Contains(tgtGuid))
+                            warnings.Add("Connector '" + elName2 + "' TargetGuid " + tgtGuid + " not in same diagram's Borders");
+                    }
+                }
+            }
+
+            // Check threat DrawingSurfaceGuids reference valid DSMs
+            var threatDsGuids = doc.SelectNodes("//kb:DrawingSurfaceGuid", nsMgr);
+            if (threatDsGuids != null)
+            {
+                foreach (XmlNode tds in threatDsGuids)
+                {
+                    var dsGuid = tds.InnerText.Trim();
+                    if (!string.IsNullOrEmpty(dsGuid) && !allDsmGuids.Contains(dsGuid))
+                        warnings.Add("Threat references DrawingSurfaceGuid " + dsGuid + " not matching any DSM");
+                }
+            }
+        }
+
         return warnings;
     }
 

@@ -82,7 +82,11 @@ python tm7_cli.py validate --input model.md
 
 ## Markdown Threat Model Format
 
-The Markdown format is the **primary authoring surface**. It uses a structured Markdown document with a Mermaid data-flow diagram and tables for threats.
+The Markdown format is the **primary authoring surface**. It uses a structured Markdown document with Mermaid data-flow diagrams and tables for threats. Two layout modes are supported: **single-diagram** (flat) and **multi-diagram**.
+
+### Single-Diagram Format
+
+When a model has one diagram the sections are flat (H2-level):
 
 ````markdown
 # Threat Model: [System Name]
@@ -151,19 +155,110 @@ graph LR
 - **Flow:** SQL Query
 - **Mitigation:** Use parameterized queries via ORM (Entity Framework / Hibernate)
 - **Justification:**
-
-### T2: Cross-Site Scripting (XSS)
-- **Category:** Tampering
-- **State:** Mitigated
-- **Priority:** Medium
-- **Risk:** Medium
-- **Description:** The web server could be subject to XSS because it does not sanitize untrusted input.
-- **Target:** Web Application
-- **Source:** User
-- **Flow:** HTTPS Request
-- **Mitigation:** Output encoding enabled via framework defaults
-- **Justification:** ASP.NET Razor auto-encodes all output by default
 ````
+
+### Multi-Diagram Format
+
+When a model has **multiple diagrams** (TMT DrawingSurfaces), each diagram gets its own `## Diagram: <Name>` section with H3 subsections. The `## Threats` section remains top-level (shared across all diagrams).
+
+````markdown
+# Threat Model: Trading System
+
+## Metadata
+- **Owner:** Security Team
+- **Date:** 2026-04-12
+
+## Diagram: External Access
+
+### Data Flow Diagram
+
+```mermaid
+graph LR
+    subgraph Internet_DMZ["Internet DMZ"]
+        Trading_Web_App[["Trading Web App (Process)"]]
+        WAF["WAF (External Interactor)"]
+    end
+    subgraph Internet_Boundary["Internet Boundary"]
+    end
+    style Internet_DMZ fill:transparent,stroke:red,stroke-width:2px,stroke-dasharray: 5 5,color:red
+    style Internet_Boundary fill:transparent,stroke:red,stroke-width:2px,stroke-dasharray: 5 5,color:red
+    External_User["External User (External Interactor)"]
+    WAF -->|"HTTPS"| External_User
+    External_User -->|"HTTPS"| WAF
+    WAF -->|"HTTP"| Trading_Web_App
+    Trading_Web_App -->|"HTTP"| WAF
+```
+
+### Elements
+
+| Name | Type | Generic Type | Notes |
+|------|------|-------------|-------|
+| External User | External Interactor | GE.EI |  |
+| Trading Web App | Process | GE.P |  |
+| WAF | External Interactor | GE.EI |  |
+
+### Data Flows
+
+| Name | Source | Target | Protocol | Authenticates Source | Provides Confidentiality | Provides Integrity |
+|------|--------|--------|----------|---------------------|-------------------------|-------------------|
+| HTTPS | WAF | External User | SE.DF.TMCore.HTTPS | Yes | Yes | Yes |
+| HTTPS | External User | WAF | SE.DF.TMCore.HTTPS | Yes | Yes | Yes |
+| HTTP | WAF | Trading Web App | SE.DF.TMCore.HTTP | Yes | No | No |
+| HTTP | Trading Web App | WAF | SE.DF.TMCore.HTTP | Yes | No | No |
+
+### Trust Boundaries
+
+| Name | Elements |
+|------|----------|
+| Internet DMZ | Trading Web App, WAF |
+| Internet Boundary |  |
+
+## Diagram: Internal Access
+
+### Data Flow Diagram
+
+```mermaid
+graph LR
+    subgraph Office_Net["Office Net"]
+        Internal_User["Internal User (External Interactor)"]
+    end
+    style Office_Net fill:transparent,stroke:red,stroke-width:2px,stroke-dasharray: 5 5,color:red
+    Internal_User -->|"HTTPS"| Trading_Web_App
+```
+
+### Elements
+
+| Name | Type | Generic Type | Notes |
+|------|------|-------------|-------|
+| Trading Web App | Process | GE.P |  |
+| Internal User | External Interactor | GE.EI |  |
+
+### Data Flows
+
+| Name | Source | Target | Protocol | Authenticates Source | Provides Confidentiality | Provides Integrity |
+|------|--------|--------|----------|---------------------|-------------------------|-------------------|
+| HTTPS | Internal User | Trading Web App | SE.DF.TMCore.HTTPS | Yes | Yes | Yes |
+
+### Trust Boundaries
+
+| Name | Elements |
+|------|----------|
+| Office Net | Internal User |
+
+## Threats
+
+### 25: Potential SQL Injection Vulnerability for SQL Database
+- **Category:** Tampering
+- **State:** Auto Generated
+...
+````
+
+**Key multi-diagram rules:**
+- Elements with the same name can appear in multiple diagrams (e.g., "Trading Web App" in all three). Each diagram keeps its own local GUIDs — no cross-diagram GUID sharing.
+- Flows reference elements within the **same** diagram. A connector's source/target must exist in its own DrawingSurfaceModel's Borders.
+- Trust boundaries are per-diagram. A boundary with the same name may appear in multiple diagrams with different contained elements.
+- Bidirectional flows appear as two separate rows (one per direction).
+- The parser auto-detects whether a Markdown file uses single-diagram or multi-diagram format.
 
 ### Element Type Reference
 
@@ -214,6 +309,50 @@ When analyzing a repository, follow this process:
 - Data flows crossing trust boundaries need confidentiality and integrity analysis
 - Data stores holding credentials or PII need special attention
 - Prefer specific TypeIds (e.g., `SE.P.TMCore.WebApp`) over generic ones when the component type is known
+
+## TM7 Validation
+
+A C# validation harness lives in `tools/tm7_validate.cs`. It uses TMT's own assemblies (auto-discovered from the ClickOnce install) to validate TM7 files the same way TMT would. Run it with:
+
+```bash
+cd tools
+dotnet run -- ../samples/model.tm7
+# or validate multiple files:
+dotnet run -- ../samples/complex.tm7 ../samples/simple.tm7
+```
+
+The validator performs three phases:
+
+| Phase | What it checks |
+|-------|----------------|
+| **Phase 1 — DCS Deserialization** | DataContractSerializer round-trip with TMT's `SerializableModelData` type and all 45 known types. Catches z:Id/z:Ref errors, missing namespaces, wrong element ordering. |
+| **Phase 2 — XML Model Checks** | Line coordinates (source ≠ target), TypeId resolution against KnowledgeBase, nil GUID detection on connectors, stencil TypeId validation. |
+| **Phase 3 — DSM Consistency** | DrawingSurfaceModel structure (GenericTypeId, Guid, Borders, Lines, Header, Zoom). Connector SourceGuid/TargetGuid must reference elements within the **same** DSM's Borders. Threat DrawingSurfaceGuids must reference a valid DSM. |
+
+> **Important:** DCS deserialization passing (Phase 1) is necessary but **not sufficient** — TMT performs post-deserialization semantic validation that Phase 2 and Phase 3 catch.
+
+## Technical Notes
+
+### Per-Diagram Element GUIDs
+
+Elements with the same name can appear in multiple TMT diagrams (DrawingSurfaces), each with a **different GUID**. The CLI preserves per-diagram GUIDs — it does not canonicalize across diagrams. This ensures connectors always reference elements within their own diagram, which TMT requires.
+
+### Bidirectional Flows
+
+TMT represents a bidirectional flow as **two connectors** sharing the same name, each with its own source/target direction. In the Mermaid DFD these render as two arrows. In the Markdown tables they appear as two rows. The TM7 generator emits two `<Connector>` elements with curve offsets (HandleY ± 50px) so they don't overlap.
+
+### Trust Boundary Types
+
+| Type | GenericTypeId | TM7 Representation |
+|------|--------------|--------------------|
+| Line boundary | `GE.TB.L` | `<Line>` in Lines |
+| Border boundary | `GE.TB` | `<Border>` in Borders with geometric containment |
+
+Border boundaries use geometric containment — an element is "inside" a boundary if its position falls within the boundary rectangle. The CLI handles this automatically during parse and generate.
+
+### z:Id Allocation
+
+TM7 uses `z:Id="iN"` / `z:Ref="iN"` for object identity within the DCS XML. When generating, the CLI scans the template for the maximum existing z:Id value and starts new allocations above it. This prevents collisions with KnowledgeBase entries.
 
 ## Scratch Directory
 

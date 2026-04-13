@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tm7_cli import (
     DataFlow,
+    Diagram,
     Element,
     MarkdownGenerator,
     MarkdownParser,
@@ -1065,6 +1066,76 @@ class TestBorderBoundaryFiltering:
         assert "Internet DMZ" in tb_names
         assert "Shared" in tb_names
 
+    def test_border_boundary_has_contained_elements(self, tmp_path: Path):
+        samples = Path(__file__).resolve().parent.parent.parent.parent.parent / "samples"
+        complex_ref = samples / "complex_reference.tm7"
+        if not complex_ref.exists():
+            pytest.skip("complex_reference.tm7 not found")
+        model = TM7Parser(complex_ref).parse()
+        dmz = next(tb for tb in model.boundaries if tb.name == "Internet DMZ")
+        assert "Trading Web App" in dmz.elements
+        assert "WAF" in dmz.elements
+
+
+# ===================================================================
+# Multi-Diagram Parsing Tests
+# ===================================================================
+
+
+class TestMultiDiagramParsing:
+    """The complex_reference.tm7 has 3 drawing surfaces.  All must be parsed."""
+
+    def test_elements_from_all_diagrams(self):
+        samples = Path(__file__).resolve().parent.parent.parent.parent.parent / "samples"
+        complex_ref = samples / "complex_reference.tm7"
+        if not complex_ref.exists():
+            pytest.skip("complex_reference.tm7 not found")
+        model = TM7Parser(complex_ref).parse()
+        names = {e.name for e in model.elements}
+        # External Access diagram
+        assert "External User" in names
+        assert "WAF" in names
+        # Internal Access diagram
+        assert "Internal User" in names
+        # Service Access diagram
+        assert "Partner Service" in names
+        # Deduped: Trading Web App appears in all 3 but only once in the list
+        assert len([e for e in model.elements if e.name == "Trading Web App"]) == 1
+
+    def test_flows_from_all_diagrams(self):
+        samples = Path(__file__).resolve().parent.parent.parent.parent.parent / "samples"
+        complex_ref = samples / "complex_reference.tm7"
+        if not complex_ref.exists():
+            pytest.skip("complex_reference.tm7 not found")
+        model = TM7Parser(complex_ref).parse()
+        # 6 from External Access + 2 from Internal Access + 2 from Service Access = 10
+        assert len(model.flows) == 10
+
+    def test_flow_guids_resolve_to_names(self):
+        samples = Path(__file__).resolve().parent.parent.parent.parent.parent / "samples"
+        complex_ref = samples / "complex_reference.tm7"
+        if not complex_ref.exists():
+            pytest.skip("complex_reference.tm7 not found")
+        model = TM7Parser(complex_ref).parse()
+        # Build map from ALL diagrams (flows use per-diagram local GUIDs)
+        guid_to_name = {}
+        for d in model.diagrams:
+            for e in d.elements:
+                guid_to_name[e.guid] = e.name
+        for df in model.flows:
+            assert df.source_guid in guid_to_name, \
+                f"Flow '{df.name}' source GUID not in element map"
+            assert df.target_guid in guid_to_name, \
+                f"Flow '{df.name}' target GUID not in element map"
+
+    def test_threats_from_all_diagrams(self):
+        samples = Path(__file__).resolve().parent.parent.parent.parent.parent / "samples"
+        complex_ref = samples / "complex_reference.tm7"
+        if not complex_ref.exists():
+            pytest.skip("complex_reference.tm7 not found")
+        model = TM7Parser(complex_ref).parse()
+        assert len(model.threats) == 43
+
 
 # ===================================================================
 # Nil GUID Fallback Tests
@@ -1091,3 +1162,86 @@ class TestNilGuidFallback:
         assert "<b:FlowGuid></b:FlowGuid>" not in text
         assert "<b:SourceGuid></b:SourceGuid>" not in text
         assert "<b:TargetGuid></b:TargetGuid>" not in text
+
+
+# ===================================================================
+# Multi-Diagram Markdown Format Tests
+# ===================================================================
+
+
+class TestMultiDiagramMarkdown:
+    """Tests for the multi-diagram Markdown format."""
+
+    def _multi_diagram_model(self) -> ThreatModel:
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Multi-Diagram")
+        a = Element(name="A", guid="aaaa", generic_type="GE.EI")
+        b = Element(name="B", guid="bbbb", generic_type="GE.P")
+        c = Element(name="C", guid="cccc", generic_type="GE.DS")
+        model.diagrams = [
+            Diagram(name="Ext", elements=[a, b],
+                    flows=[DataFlow(name="F1", guid="f1", source_guid="aaaa", target_guid="bbbb")],
+                    boundaries=[TrustBoundary(name="TB1", guid="t1", elements=["A"])]),
+            Diagram(name="Int", elements=[b, c],
+                    flows=[DataFlow(name="F2", guid="f2", source_guid="bbbb", target_guid="cccc")],
+                    boundaries=[]),
+        ]
+        model.threats = [Threat(id="1", title="X", category="Tampering",
+                                state="Needs Investigation", priority="High")]
+        return model
+
+    def test_generates_diagram_sections(self):
+        model = self._multi_diagram_model()
+        md = MarkdownGenerator().generate(model)
+        assert "## Diagram: Ext" in md
+        assert "## Diagram: Int" in md
+        # H3 subsections inside diagrams
+        assert "### Elements" in md
+        assert "### Data Flows" in md
+
+    def test_each_diagram_has_own_elements(self):
+        model = self._multi_diagram_model()
+        md = MarkdownGenerator().generate(model)
+        # Both diagrams should have their own tables
+        assert md.count("### Elements") == 2
+        assert md.count("### Data Flows") == 2
+
+    def test_threats_at_top_level(self):
+        model = self._multi_diagram_model()
+        md = MarkdownGenerator().generate(model)
+        assert "## Threats" in md
+
+    def test_round_trip_preserves_diagrams(self, tmp_path: Path):
+        model = self._multi_diagram_model()
+        md = MarkdownGenerator().generate(model)
+        p = tmp_path / "multi.md"
+        p.write_text(md, encoding="utf-8")
+        model2 = MarkdownParser(p).parse()
+        assert len(model2.diagrams) == 2
+        assert model2.diagrams[0].name == "Ext"
+        assert model2.diagrams[1].name == "Int"
+        assert len(model2.diagrams[0].elements) == 2
+        assert len(model2.diagrams[1].elements) == 2
+        assert len(model2.diagrams[0].flows) == 1
+        assert len(model2.diagrams[1].flows) == 1
+
+    def test_single_diagram_uses_flat_format(self, sample_model: ThreatModel):
+        md = MarkdownGenerator().generate(sample_model)
+        assert "## Diagram:" not in md
+        assert "## Data Flow Diagram" in md
+        assert "## Elements" in md
+
+    def test_multi_diagram_tm7_generation(self):
+        model = self._multi_diagram_model()
+        text = TM7Generator().generate_text(model)
+        # Should have 2 DrawingSurfaceModel entries
+        assert text.count("DrawingSurfaceModel") >= 4  # open + close tags * 2
+        assert ">Ext<" in text
+        assert ">Int<" in text
+
+    def test_multi_diagram_tm7_unique_zids(self):
+        model = self._multi_diagram_model()
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        ids = _re.findall(r'z:Id="(i\d+)"', text)
+        assert len(ids) == len(set(ids)), f"Duplicate z:Id values: {[x for x in ids if ids.count(x) > 1]}"

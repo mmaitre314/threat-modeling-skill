@@ -136,12 +136,70 @@ class Threat:
 
 
 @dataclass
-class ThreatModel:
-    meta: ThreatModelMeta = field(default_factory=ThreatModelMeta)
+class Diagram:
+    """A single drawing surface (DFD diagram page) in the threat model."""
+    name: str = ""
+    guid: str = ""
     elements: list[Element] = field(default_factory=list)
     flows: list[DataFlow] = field(default_factory=list)
     boundaries: list[TrustBoundary] = field(default_factory=list)
+
+
+@dataclass
+class ThreatModel:
+    meta: ThreatModelMeta = field(default_factory=ThreatModelMeta)
+    diagrams: list[Diagram] = field(default_factory=list)
     threats: list[Threat] = field(default_factory=list)
+
+    # Convenience flat accessors (union across all diagrams)
+    @property
+    def elements(self) -> list[Element]:
+        seen: set[str] = set()
+        result: list[Element] = []
+        for d in self.diagrams:
+            for e in d.elements:
+                if e.name not in seen:
+                    seen.add(e.name)
+                    result.append(e)
+        return result
+
+    @elements.setter
+    def elements(self, value: list[Element]):
+        if not self.diagrams:
+            self.diagrams.append(Diagram())
+        self.diagrams[0].elements = value
+
+    @property
+    def flows(self) -> list[DataFlow]:
+        return [f for d in self.diagrams for f in d.flows]
+
+    @flows.setter
+    def flows(self, value: list[DataFlow]):
+        if not self.diagrams:
+            self.diagrams.append(Diagram())
+        self.diagrams[0].flows = value
+
+    @property
+    def boundaries(self) -> list[TrustBoundary]:
+        merged: dict[str, TrustBoundary] = {}
+        for d in self.diagrams:
+            for tb in d.boundaries:
+                if tb.name in merged:
+                    for en in tb.elements:
+                        if en not in merged[tb.name].elements:
+                            merged[tb.name].elements.append(en)
+                else:
+                    merged[tb.name] = TrustBoundary(
+                        name=tb.name, guid=tb.guid,
+                        generic_type=tb.generic_type,
+                        elements=list(tb.elements))
+        return list(merged.values())
+
+    @boundaries.setter
+    def boundaries(self, value: list[TrustBoundary]):
+        if not self.diagrams:
+            self.diagrams.append(Diagram())
+        self.diagrams[0].boundaries = value
 
 
 # ---------------------------------------------------------------------------
@@ -180,18 +238,23 @@ class TM7Parser:
     def __init__(self, path: str | Path):
         self.tree = ET.parse(path)
         self.root = self.tree.getroot()
-        self._extra_boundaries: list[TrustBoundary] = []
 
     def parse(self) -> ThreatModel:
         model = ThreatModel()
         model.meta = self._parse_meta()
-        model.elements = self._parse_elements()
-        model.flows = self._parse_flows()
-        model.boundaries = self._parse_boundaries() + self._extra_boundaries
+
+        # Build one Diagram per DrawingSurfaceModel
+        for ds in self._iter_drawing_surfaces():
+            diag = self._parse_diagram(ds)
+            model.diagrams.append(diag)
+
         model.threats = self._parse_threats()
 
-        # Resolve guid references to names in threats
-        guid_to_name = {e.guid: e.name for e in model.elements}
+        # Build guid→name map across ALL diagram copies for threat resolution
+        guid_to_name: dict[str, str] = {}
+        for d in model.diagrams:
+            for el in d.elements:
+                guid_to_name[el.guid] = el.name
         flow_guid_to_name = {f.guid: f.name for f in model.flows}
         for t in model.threats:
             if t.source_guid and t.source_guid in guid_to_name:
@@ -217,138 +280,132 @@ class TM7Parser:
         m.contributors = self._text(meta_el, "Contributors")
         return m
 
-    def _parse_elements(self) -> list[Element]:
-        elements = []
-        ds = self.root.find(
-            f"{_tag(NS_TM, 'DrawingSurfaceList')}/{_tag(NS_TM, 'DrawingSurfaceModel')}"
-        )
-        if ds is None:
-            return elements
+    def _iter_drawing_surfaces(self):
+        """Yield all DrawingSurfaceModel elements."""
+        ds_list = self.root.find(_tag(NS_TM, "DrawingSurfaceList"))
+        if ds_list is None:
+            return
+        for ds in ds_list.findall(_tag(NS_TM, "DrawingSurfaceModel")):
+            yield ds
 
+    def _parse_diagram(self, ds) -> Diagram:
+        """Parse a single DrawingSurfaceModel into a Diagram."""
+        diag = Diagram()
+
+        # Diagram name from Header element
+        header = ds.find(_tag(NS_TM, "Header"))
+        if header is not None and header.text:
+            diag.name = header.text.strip()
+
+        # Diagram GUID
+        guid_el = ds.find(_tag(NS_ABS, "Guid"))
+        if guid_el is not None and guid_el.text:
+            diag.guid = guid_el.text.strip()
+
+        # --- Borders: elements + border boundaries ---
         borders = ds.find(_tag(NS_TM, "Borders"))
-        if borders is None:
-            return elements
+        stencil_rects: list[tuple[str, float, float, float, float]] = []
+        boundary_entries: list[tuple[TrustBoundary, float, float, float, float]] = []
 
-        for kv in borders:
-            val = kv.find(_tag(NS_ARR, "Value"))
-            if val is None:
-                continue
-            gtype = self._child_text(val, NS_ABS, "GenericTypeId")
-            # Skip border boundaries (box trust boundaries) and annotations
-            if gtype == _BORDER_BOUNDARY_GTYPE or gtype == "GE.A":
-                continue
-            el = Element()
-            el.guid = self._child_text(val, NS_ABS, "Guid")
-            el.generic_type = gtype
-            el.type_id = self._child_text(val, NS_ABS, "TypeId")
-            el.x = float(self._child_text(val, NS_ABS, "Left") or "0")
-            el.y = float(self._child_text(val, NS_ABS, "Top") or "0")
-            el.width = float(self._child_text(val, NS_ABS, "Width") or "100")
-            el.height = float(self._child_text(val, NS_ABS, "Height") or "100")
+        if borders is not None:
+            for kv in borders:
+                val = kv.find(_tag(NS_ARR, "Value"))
+                if val is None:
+                    continue
+                gtype = self._child_text(val, NS_ABS, "GenericTypeId")
 
-            # Parse properties for name
-            props = val.find(_tag(NS_ABS, "Properties"))
-            if props is not None:
-                el.name, el.out_of_scope, el.properties = self._parse_props(props)
+                x = float(self._child_text(val, NS_ABS, "Left") or "0")
+                y = float(self._child_text(val, NS_ABS, "Top") or "0")
+                w = float(self._child_text(val, NS_ABS, "Width") or "0")
+                h = float(self._child_text(val, NS_ABS, "Height") or "0")
 
-            if not el.name:
-                el.name = el.type_id or el.generic_type
+                is_boundary = (
+                    (gtype and gtype.startswith("GE.TB"))
+                    or gtype == _BORDER_BOUNDARY_GTYPE
+                )
 
-            elements.append(el)
+                if is_boundary:
+                    tb = TrustBoundary()
+                    tb.guid = self._child_text(val, NS_ABS, "Guid")
+                    tb.generic_type = gtype if gtype.startswith("GE.TB") else "GE.TB.B"
+                    props = val.find(_tag(NS_ABS, "Properties"))
+                    if props is not None:
+                        tb.name, _, _ = self._parse_props(props)
+                    if not tb.name:
+                        tb.name = gtype
+                    boundary_entries.append((tb, x, y, w, h))
+                elif gtype == "GE.A":
+                    continue  # skip annotations
+                else:
+                    el = Element()
+                    el.guid = self._child_text(val, NS_ABS, "Guid")
+                    el.generic_type = gtype
+                    el.type_id = self._child_text(val, NS_ABS, "TypeId")
+                    el.x = x
+                    el.y = y
+                    el.width = w
+                    el.height = h
+                    props = val.find(_tag(NS_ABS, "Properties"))
+                    if props is not None:
+                        el.name, el.out_of_scope, el.properties = self._parse_props(props)
+                    if not el.name:
+                        el.name = el.type_id or el.generic_type
+                    diag.elements.append(el)
+                    stencil_rects.append((el.name, x, y, w, h))
 
-        return elements
+        # Geometric containment for border boundaries
+        for tb, bx, by, bw, bh in boundary_entries:
+            for el_name, ex, ey, ew, eh in stencil_rects:
+                if (ex >= bx and ey >= by
+                        and ex + ew <= bx + bw and ey + eh <= by + bh):
+                    tb.elements.append(el_name)
+            diag.boundaries.append(tb)
 
-    def _parse_flows(self) -> list[DataFlow]:
-        flows = []
-        ds = self.root.find(
-            f"{_tag(NS_TM, 'DrawingSurfaceList')}/{_tag(NS_TM, 'DrawingSurfaceModel')}"
-        )
-        if ds is None:
-            return flows
-
+        # --- Lines: flows + line boundaries ---
         lines = ds.find(_tag(NS_TM, "Lines"))
-        if lines is None:
-            return flows
+        if lines is not None:
+            for kv in lines:
+                val = kv.find(_tag(NS_ARR, "Value"))
+                if val is None:
+                    continue
 
-        for kv in lines:
-            val = kv.find(_tag(NS_ARR, "Value"))
-            if val is None:
-                continue
+                gtype_check = self._child_text(val, NS_ABS, "GenericTypeId")
+                typeid_check = self._child_text(val, NS_ABS, "TypeId")
 
-            # Skip trust boundary lines (they are not data flows)
-            gtype_check = self._child_text(val, NS_ABS, "GenericTypeId")
-            typeid_check = self._child_text(val, NS_ABS, "TypeId")
-            if (gtype_check and "TB" in gtype_check) or (typeid_check and ".TB." in typeid_check):
-                # Parse as trust boundary instead
-                tb = TrustBoundary()
-                tb.guid = self._child_text(val, NS_ABS, "Guid")
-                tb.generic_type = gtype_check or "GE.TB"
+                if (gtype_check and "TB" in gtype_check) or (typeid_check and ".TB." in typeid_check):
+                    tb = TrustBoundary()
+                    tb.guid = self._child_text(val, NS_ABS, "Guid")
+                    tb.generic_type = gtype_check or "GE.TB"
+                    props = val.find(_tag(NS_ABS, "Properties"))
+                    if props is not None:
+                        tb.name, _, _ = self._parse_props(props)
+                    if not tb.name:
+                        tb.name = typeid_check or gtype_check
+                    diag.boundaries.append(tb)
+                    continue
+
+                df = DataFlow()
+                df.guid = self._child_text(val, NS_ABS, "Guid")
+                df.generic_type = self._child_text(val, NS_ABS, "GenericTypeId")
+                df.type_id = self._child_text(val, NS_ABS, "TypeId")
+                df.source_guid = self._child_text(val, NS_ABS, "SourceGuid")
+                df.target_guid = self._child_text(val, NS_ABS, "TargetGuid")
+
                 props = val.find(_tag(NS_ABS, "Properties"))
                 if props is not None:
-                    tb.name, _, _ = self._parse_props(props)
-                if not tb.name:
-                    tb.name = typeid_check or gtype_check
-                self._extra_boundaries.append(tb)
-                continue
+                    df.name, df.out_of_scope, extra = self._parse_props(props)
+                    df.authenticates_source = extra.get("authenticatesSource", "Not Selected")
+                    df.authenticates_destination = extra.get("authenticatesDestination", "Not Selected")
+                    df.provides_confidentiality = extra.get("providesConfidentiality", "No")
+                    df.provides_integrity = extra.get("providesIntegrity", "No")
+                    df.properties = extra
 
-            df = DataFlow()
-            df.guid = self._child_text(val, NS_ABS, "Guid")
-            df.generic_type = self._child_text(val, NS_ABS, "GenericTypeId")
-            df.type_id = self._child_text(val, NS_ABS, "TypeId")
-            df.source_guid = self._child_text(val, NS_ABS, "SourceGuid")
-            df.target_guid = self._child_text(val, NS_ABS, "TargetGuid")
+                if not df.name:
+                    df.name = df.type_id or df.generic_type
 
-            props = val.find(_tag(NS_ABS, "Properties"))
-            if props is not None:
-                df.name, df.out_of_scope, extra = self._parse_props(props)
-                df.authenticates_source = extra.get("authenticatesSource", "Not Selected")
-                df.authenticates_destination = extra.get("authenticatesDestination", "Not Selected")
-                df.provides_confidentiality = extra.get("providesConfidentiality", "No")
-                df.provides_integrity = extra.get("providesIntegrity", "No")
-                df.properties = extra
+                diag.flows.append(df)
 
-            if not df.name:
-                df.name = df.type_id or df.generic_type
-
-            flows.append(df)
-
-        return flows
-
-    def _parse_boundaries(self) -> list[TrustBoundary]:
-        boundaries = []
-        ds = self.root.find(
-            f"{_tag(NS_TM, 'DrawingSurfaceList')}/{_tag(NS_TM, 'DrawingSurfaceModel')}"
-        )
-        if ds is None:
-            return boundaries
-
-        borders = ds.find(_tag(NS_TM, "Borders"))
-        if borders is None:
-            return boundaries
-
-        for kv in borders:
-            val = kv.find(_tag(NS_ARR, "Value"))
-            if val is None:
-                continue
-            gtype = self._child_text(val, NS_ABS, "GenericTypeId")
-            # Match both GE.TB.* (generic boundaries) and the well-known
-            # GUID for BorderBoundary (box-shaped trust boundaries)
-            is_boundary = (
-                (gtype and gtype.startswith("GE.TB"))
-                or gtype == _BORDER_BOUNDARY_GTYPE
-            )
-            if is_boundary:
-                tb = TrustBoundary()
-                tb.guid = self._child_text(val, NS_ABS, "Guid")
-                tb.generic_type = gtype if gtype.startswith("GE.TB") else "GE.TB.B"
-                props = val.find(_tag(NS_ABS, "Properties"))
-                if props is not None:
-                    tb.name, _, _ = self._parse_props(props)
-                if not tb.name:
-                    tb.name = gtype
-                boundaries.append(tb)
-
-        return boundaries
+        return diag
 
     def _parse_threats(self) -> list[Threat]:
         threats = []
@@ -478,15 +535,40 @@ class MarkdownParser:
     def parse(self) -> ThreatModel:
         model = ThreatModel()
         model.meta = self._parse_meta()
-        model.elements = self._parse_elements()
-        model.flows = self._parse_flows()
-        model.boundaries = self._parse_boundaries()
+
+        # Detect multi-diagram format: look for ## Diagram: sections
+        diagram_sections = list(re.finditer(
+            r"^## Diagram:\s*(.+?)\s*$(.*?)(?=^## |\Z)",
+            self.text, re.MULTILINE | re.DOTALL))
+
+        if diagram_sections:
+            for dm in diagram_sections:
+                diag = Diagram(name=dm.group(1).strip())
+                body = dm.group(2)
+                diag.elements = self._parse_elements_from(body, level=3)
+                diag.flows = self._parse_flows_from(body, level=3)
+                diag.boundaries = self._parse_boundaries_from(body, level=3)
+                model.diagrams.append(diag)
+        else:
+            # Legacy flat format: single unnamed diagram
+            diag = Diagram()
+            diag.elements = self._parse_elements_from(self.text, level=2)
+            diag.flows = self._parse_flows_from(self.text, level=2)
+            diag.boundaries = self._parse_boundaries_from(self.text, level=2)
+            model.diagrams.append(diag)
+
         model.threats = self._parse_threats()
         return model
 
     def _get_section(self, heading: str, level: int = 2) -> str:
         pattern = rf"^{'#' * level}\s+{re.escape(heading)}\s*$(.*?)(?=^{'#' * level}\s|\Z)"
         m = re.search(pattern, self.text, re.MULTILINE | re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    @staticmethod
+    def _get_section_from(text: str, heading: str, level: int = 2) -> str:
+        pattern = rf"^{'#' * level}\s+{re.escape(heading)}\s*$(.*?)(?=^{'#' * level}\s|\Z)"
+        m = re.search(pattern, text, re.MULTILINE | re.DOTALL)
         return m.group(1).strip() if m else ""
 
     def _parse_meta(self) -> ThreatModelMeta:
@@ -540,8 +622,8 @@ class MarkdownParser:
                 rows.append(row)
         return rows
 
-    def _parse_elements(self) -> list[Element]:
-        section = self._get_section("Elements")
+    def _parse_elements_from(self, text: str, level: int = 2) -> list[Element]:
+        section = self._get_section_from(text, "Elements", level)
         rows = self._parse_table(section)
         elements = []
         for row in rows:
@@ -561,8 +643,8 @@ class MarkdownParser:
             elements.append(el)
         return elements
 
-    def _parse_flows(self) -> list[DataFlow]:
-        section = self._get_section("Data Flows")
+    def _parse_flows_from(self, text: str, level: int = 2) -> list[DataFlow]:
+        section = self._get_section_from(text, "Data Flows", level)
         rows = self._parse_table(section)
         flows = []
         for row in rows:
@@ -578,8 +660,8 @@ class MarkdownParser:
             flows.append(df)
         return flows
 
-    def _parse_boundaries(self) -> list[TrustBoundary]:
-        section = self._get_section("Trust Boundaries")
+    def _parse_boundaries_from(self, text: str, level: int = 2) -> list[TrustBoundary]:
+        section = self._get_section_from(text, "Trust Boundaries", level)
         rows = self._parse_table(section)
         boundaries = []
         for row in rows:
@@ -669,57 +751,21 @@ class MarkdownGenerator:
         lines.append(f"- **External Dependencies:** {meta.external_dependencies}")
         lines.append("")
 
-        # DFD
-        lines.append("## Data Flow Diagram")
-        lines.append("")
-        lines.append("```mermaid")
-        lines.append("graph LR")
-        lines.extend(self._mermaid_dfd(model))
-        lines.append("```")
-        lines.append("")
+        diagrams = model.diagrams if model.diagrams else [Diagram()]
+        if len(diagrams) <= 1:
+            # Single diagram: flat format (backward compatible)
+            diag = diagrams[0]
+            lines.extend(self._diagram_body(diag, model.elements, model.flows,
+                                            model.boundaries, h_offset=0))
+        else:
+            # Multiple diagrams: per-diagram sections
+            for diag in diagrams:
+                lines.append(f"## Diagram: {diag.name or 'Untitled'}")
+                lines.append("")
+                lines.extend(self._diagram_body(diag, diag.elements, diag.flows,
+                                                diag.boundaries, h_offset=1))
 
-        # Elements table
-        lines.append("## Elements")
-        lines.append("")
-        lines.append("| Name | Type | Generic Type | Notes |")
-        lines.append("|------|------|-------------|-------|")
-        for el in model.elements:
-            type_label = {
-                "GE.EI": "External Interactor",
-                "GE.P": "Process",
-                "GE.DS": "Data Store",
-            }.get(el.generic_type, el.generic_type)
-            lines.append(f"| {el.name} | {type_label} | {el.generic_type} | {el.notes} |")
-        lines.append("")
-
-        # Data Flows table
-        guid_to_name = {e.guid: e.name for e in model.elements}
-        lines.append("## Data Flows")
-        lines.append("")
-        lines.append("| Name | Source | Target | Protocol | Authenticates Source | Provides Confidentiality | Provides Integrity |")
-        lines.append("|------|--------|--------|----------|---------------------|-------------------------|-------------------|")
-        for df in model.flows:
-            src = guid_to_name.get(df.source_guid, df.source_guid)
-            tgt = guid_to_name.get(df.target_guid, df.target_guid)
-            protocol = df.type_id or df.protocol
-            lines.append(
-                f"| {df.name} | {src} | {tgt} | {protocol} "
-                f"| {df.authenticates_source} | {df.provides_confidentiality} | {df.provides_integrity} |"
-            )
-        lines.append("")
-
-        # Trust Boundaries
-        if model.boundaries:
-            lines.append("## Trust Boundaries")
-            lines.append("")
-            lines.append("| Name | Elements |")
-            lines.append("|------|----------|")
-            for tb in model.boundaries:
-                elems = ", ".join(tb.elements) if tb.elements else ""
-                lines.append(f"| {tb.name} | {elems} |")
-            lines.append("")
-
-        # Threats
+        # Threats (always at top level)
         lines.append("## Threats")
         lines.append("")
         for i, t in enumerate(model.threats, 1):
@@ -739,37 +785,90 @@ class MarkdownGenerator:
 
         return "\n".join(lines)
 
-    def _mermaid_dfd(self, model: ThreatModel) -> list[str]:
+    def _diagram_body(self, diag: Diagram, elements: list[Element],
+                      flows: list[DataFlow], boundaries: list[TrustBoundary],
+                      h_offset: int = 0) -> list[str]:
+        """Generate DFD, elements table, flows table, boundaries table.
+
+        *h_offset*: 0 → H2+H3 headings (flat), 1 → H3+H4 headings (per-diagram).
+        """
+        h2 = "#" * (2 + h_offset)
+        lines: list[str] = []
+
+        # DFD
+        lines.append(f"{h2} Data Flow Diagram")
+        lines.append("")
+        lines.append("```mermaid")
+        lines.append("graph LR")
+        lines.extend(self._mermaid_dfd(elements, flows, boundaries))
+        lines.append("```")
+        lines.append("")
+
+        # Elements table
+        lines.append(f"{h2} Elements")
+        lines.append("")
+        lines.append("| Name | Type | Generic Type | Notes |")
+        lines.append("|------|------|-------------|-------|")
+        for el in elements:
+            type_label = {
+                "GE.EI": "External Interactor",
+                "GE.P": "Process",
+                "GE.DS": "Data Store",
+            }.get(el.generic_type, el.generic_type)
+            lines.append(f"| {el.name} | {type_label} | {el.generic_type} | {el.notes} |")
+        lines.append("")
+
+        # Data Flows table
+        guid_to_name = {e.guid: e.name for e in elements}
+        lines.append(f"{h2} Data Flows")
+        lines.append("")
+        lines.append("| Name | Source | Target | Protocol | Authenticates Source | Provides Confidentiality | Provides Integrity |")
+        lines.append("|------|--------|--------|----------|---------------------|-------------------------|-------------------|")
+        for df in flows:
+            src = guid_to_name.get(df.source_guid, df.source_guid)
+            tgt = guid_to_name.get(df.target_guid, df.target_guid)
+            protocol = df.type_id or df.protocol
+            lines.append(
+                f"| {df.name} | {src} | {tgt} | {protocol} "
+                f"| {df.authenticates_source} | {df.provides_confidentiality} | {df.provides_integrity} |"
+            )
+        lines.append("")
+
+        # Trust Boundaries
+        if boundaries:
+            lines.append(f"{h2} Trust Boundaries")
+            lines.append("")
+            lines.append("| Name | Elements |")
+            lines.append("|------|----------|")
+            for tb in boundaries:
+                elems = ", ".join(tb.elements) if tb.elements else ""
+                lines.append(f"| {tb.name} | {elems} |")
+            lines.append("")
+
+        return lines
+
+    def _mermaid_dfd(self, elements: list[Element], flows: list[DataFlow],
+                     boundaries: list[TrustBoundary]) -> list[str]:
         lines = []
-        guid_to_name = {e.guid: e.name for e in model.elements}
+        guid_to_name = {e.guid: e.name for e in elements}
         # Sanitize name for Mermaid ID
         def mid(name: str) -> str:
             return re.sub(r"[^a-zA-Z0-9_]", "", name.replace(" ", "_"))
 
-        # Group elements by boundary
-        elem_in_boundary: dict[str, list[Element]] = {}
-        boundary_names = set()
-        for tb in model.boundaries:
-            boundary_names.add(tb.name)
-            for ename in tb.elements:
-                if ename not in elem_in_boundary:
-                    elem_in_boundary[ename] = []
-                elem_in_boundary.setdefault(tb.name, [])
-
         # Track which elements are in a boundary
         in_boundary = set()
-        for tb in model.boundaries:
+        for tb in boundaries:
             for ename in tb.elements:
                 in_boundary.add(ename)
 
         # Render boundaries as subgraphs with red dashed styling
         tb_ids: list[str] = []
-        for tb in model.boundaries:
+        for tb in boundaries:
             sg_id = mid(tb.name)
             tb_ids.append(sg_id)
             lines.append(f'    subgraph {sg_id}["{tb.name}"]')
             for ename in tb.elements:
-                el = next((e for e in model.elements if e.name == ename), None)
+                el = next((e for e in elements if e.name == ename), None)
                 if el:
                     lines.append(f"        {self._mermaid_node(el)}")
             lines.append("    end")
@@ -777,12 +876,12 @@ class MarkdownGenerator:
             lines.append(f"    style {sg_id} fill:transparent,stroke:red,stroke-width:2px,stroke-dasharray: 5 5,color:red")
 
         # Render elements not in any boundary
-        for el in model.elements:
+        for el in elements:
             if el.name not in in_boundary:
                 lines.append(f"    {self._mermaid_node(el)}")
 
         # Render flows
-        for df in model.flows:
+        for df in flows:
             src_name = guid_to_name.get(df.source_guid, df.source_guid)
             tgt_name = guid_to_name.get(df.target_guid, df.target_guid)
             src_id = mid(src_name)
@@ -972,12 +1071,42 @@ class TM7Generator:
                 text, count=1,
             )
 
-        # --- Borders (elements only, with z:Id starting at i3 to avoid template's i1,i2) ---
-        borders_xml, el_positions = self._borders_xml(model, z_id_start=3)
-        text = _splice_section(text, "Borders", borders_xml)
-        # --- Lines (flows + trust boundaries, z:Id continues after borders) ---
-        lines_z_start = 3 + len(model.elements)
-        text = _splice_section(text, "Lines", self._lines_xml(model, el_positions, z_id_start=lines_z_start))
+        diagrams = model.diagrams if model.diagrams else [Diagram()]
+
+        # Find the max z:Id in the template so we don't collide with
+        # KnowledgeBase or other template-level z:Id values.
+        existing_ids = [int(m.group(1)) for m in re.finditer(r'z:Id="i(\d+)"', text)]
+        z_start = max(existing_ids, default=2) + 1
+
+        if len(diagrams) <= 1:
+            # Single diagram: splice into the existing DrawingSurfaceModel
+            diag = diagrams[0]
+            borders_xml, el_positions = self._borders_xml(diag.elements, z_id_start=z_start)
+            text = _splice_section(text, "Borders", borders_xml)
+            lines_z_start = z_start + len(diag.elements)
+            text = _splice_section(text, "Lines",
+                                   self._lines_xml(diag.elements, diag.flows,
+                                                   diag.boundaries, el_positions,
+                                                   z_id_start=lines_z_start))
+            if diag.name:
+                text = _splice_section(text, "Header", _xml_escape(diag.name))
+        else:
+            # Multi-diagram: build all DrawingSurfaceModel blocks and
+            # replace the DrawingSurfaceList content.
+            dsm_parts: list[str] = []
+            z_id = z_start
+            for i, diag in enumerate(diagrams):
+                dsm_z_id = f"i{z_id}"
+                z_id += 1
+                borders_xml, el_positions = self._borders_xml(diag.elements, z_id_start=z_id)
+                z_id += len(diag.elements)
+                lines_xml = self._lines_xml(diag.elements, diag.flows,
+                                            diag.boundaries, el_positions,
+                                            z_id_start=z_id)
+                z_id += len(diag.flows) + len(diag.boundaries)
+                dsm_parts.append(self._dsm_xml(diag, dsm_z_id, borders_xml, lines_xml))
+            text = _splice_section(text, "DrawingSurfaceList", "".join(dsm_parts))
+
         # --- ThreatInstances ---
         ds_m = re.search(r"<Guid[^>]*>([0-9a-fA-F-]+)</Guid>", text)
         ds_guid = ds_m.group(1) if ds_m else str(uuid.uuid4())
@@ -985,12 +1114,40 @@ class TM7Generator:
 
         return text
 
+    @staticmethod
+    def _dsm_xml(diag: 'Diagram', z_id: str, borders_xml: str, lines_xml: str) -> str:
+        """Build a complete DrawingSurfaceModel XML block."""
+        dsm_guid = diag.guid or str(uuid.uuid4())
+        name = _xml_escape(diag.name or "Diagram")
+        ns_abs = "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts"
+        ns_arr = "http://schemas.microsoft.com/2003/10/Serialization/Arrays"
+        ns_i = "http://www.w3.org/2001/XMLSchema-instance"
+        ns_kb = "http://schemas.datacontract.org/2004/07/ThreatModeling.KnowledgeBase"
+        ns_xs = "http://www.w3.org/2001/XMLSchema"
+        ns_z = "http://schemas.microsoft.com/2003/10/Serialization/"
+        return (
+            f'<DrawingSurfaceModel z:Id="{z_id}" xmlns:z="{ns_z}">'
+            f'<GenericTypeId xmlns="{ns_abs}">DRAWINGSURFACE</GenericTypeId>'
+            f'<Guid xmlns="{ns_abs}">{dsm_guid}</Guid>'
+            f'<Properties xmlns="{ns_abs}" xmlns:a="{ns_arr}">'
+            f'<a:anyType i:type="b:StringDisplayAttribute" xmlns:i="{ns_i}" xmlns:b="{ns_kb}">'
+            f'<b:DisplayName>Name</b:DisplayName><b:Name>Name</b:Name>'
+            f'<b:Value i:type="c:string" xmlns:c="{ns_xs}">{name}</b:Value>'
+            f'</a:anyType></Properties>'
+            f'<TypeId xmlns="{ns_abs}">DRAWINGSURFACE</TypeId>'
+            f'<Borders xmlns:a="{ns_arr}">{borders_xml}</Borders>'
+            f'<Header>{name}</Header>'
+            f'<Lines xmlns:a="{ns_arr}">{lines_xml}</Lines>'
+            f'<Zoom>1</Zoom>'
+            f'</DrawingSurfaceModel>'
+        )
+
     # --- fragment builders (self-contained namespace declarations) ---
 
     @staticmethod
-    def _borders_xml(model: ThreatModel, z_id_start: int = 3) -> tuple[str, dict]:
+    def _borders_xml(elements: list[Element], z_id_start: int = 3) -> tuple[str, dict]:
         """Return (xml_fragment, {guid: (left, top, width, height)})."""
-        if not model.elements:
+        if not elements:
             return "", {}
         NS = {
             "a": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
@@ -1003,7 +1160,7 @@ class TM7Generator:
         positions: dict[str, tuple[int, int, int, int]] = {}
         x_pos = 50.0
         z_id = z_id_start
-        for el in model.elements:
+        for el in elements:
             left = int(x_pos)
             top = 100
             w = int(el.width)
@@ -1017,10 +1174,12 @@ class TM7Generator:
         return "".join(parts), positions
 
     @staticmethod
-    def _lines_xml(model: ThreatModel, el_positions: dict, z_id_start: int = 3) -> str:
-        if not model.flows and not model.boundaries:
+    def _lines_xml(elements: list[Element], flows: list[DataFlow],
+                   boundaries: list[TrustBoundary], el_positions: dict,
+                   z_id_start: int = 3) -> str:
+        if not flows and not boundaries:
             return ""
-        name_to_guid = {e.name: e.guid for e in model.elements}
+        name_to_guid = {e.name: e.guid for e in elements}
         NS = {
             "a": "http://schemas.microsoft.com/2003/10/Serialization/Arrays",
             "abs": "http://schemas.datacontract.org/2004/07/ThreatModeling.Model.Abstracts",
@@ -1037,7 +1196,7 @@ class TM7Generator:
         pair_seen: dict[tuple[str, str], int] = {}  # (min_guid, max_guid) -> count
         CURVE_OFFSET = 50  # pixels above/below the straight line for curves
 
-        for df in model.flows:
+        for df in flows:
             sg = name_to_guid.get(df.source_guid, df.source_guid)
             tg = name_to_guid.get(df.target_guid, df.target_guid)
             df.source_guid, df.target_guid = sg, tg
@@ -1109,7 +1268,7 @@ class TM7Generator:
         else:
             tb_min_y, tb_max_y = 10, 306
         tb_x_offset = 0
-        for tb in model.boundaries:
+        for tb in boundaries:
             tb_generic = "GE.TB.L" if tb.generic_type == "GE.TB" else tb.generic_type
             # Place boundary line between elements; shift each boundary right
             tb_x = 270 + tb_x_offset
