@@ -1245,3 +1245,131 @@ class TestMultiDiagramMarkdown:
         import re as _re
         ids = _re.findall(r'z:Id="(i\d+)"', text)
         assert len(ids) == len(set(ids)), f"Duplicate z:Id values: {[x for x in ids if ids.count(x) > 1]}"
+
+
+# ===================================================================
+# Layout Wrapping Tests — ensure coordinates stay within canvas bounds
+# ===================================================================
+
+
+class TestLayoutWrapping:
+    """Verify that the layout engine wraps to new rows for wide models."""
+
+    MAX_CANVAS = 1200  # must match the value in tm7_cli.py _borders_xml
+
+    def _wide_model(self) -> ThreatModel:
+        """Create a model with many boundary groups that would exceed canvas width."""
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Wide")
+        diag = Diagram(name="D1")
+        for i in range(8):
+            el = Element(name=f"Proc{i}", guid=str(uuid.uuid4()), generic_type="GE.P")
+            diag.elements.append(el)
+            diag.boundaries.append(
+                TrustBoundary(name=f"TB{i}", guid=str(uuid.uuid4()), elements=[f"Proc{i}"])
+            )
+        model.diagrams = [diag]
+        return model
+
+    def test_all_elements_within_canvas_width(self):
+        model = self._wide_model()
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        lefts = [int(v) for v in _re.findall(r"<Left[^>]*>(\d+)</Left>", text)]
+        widths = [int(v) for v in _re.findall(r"<Width[^>]*>(\d+)</Width>", text)]
+        max_right = max(l + w for l, w in zip(lefts, widths))
+        assert max_right <= self.MAX_CANVAS + 200, \
+            f"Elements extend to x={max_right}, expected within {self.MAX_CANVAS + 200}"
+
+    def test_wrapping_produces_multiple_y_levels(self):
+        model = self._wide_model()
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        tops = set(int(v) for v in _re.findall(r"<Top[^>]*>(\d+)</Top>", text))
+        assert len(tops) > 1, "All elements on same row — wrapping did not occur"
+
+    def test_small_model_stays_single_row(self):
+        """A model with 2 boundary groups should not wrap."""
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Small")
+        diag = Diagram(name="D1")
+        for i in range(2):
+            el = Element(name=f"Proc{i}", guid=str(uuid.uuid4()), generic_type="GE.P")
+            diag.elements.append(el)
+            diag.boundaries.append(
+                TrustBoundary(name=f"TB{i}", guid=str(uuid.uuid4()), elements=[f"Proc{i}"])
+            )
+        model.diagrams = [diag]
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        # Stencil elements (not boundaries) should all be at the same base Top
+        # Filter out BorderBoundary Top values by finding stencil tops
+        tops = _re.findall(r'i:type="Stencil\w+".*?<Top[^>]*>(\d+)</Top>', text, re.DOTALL)
+        unique = set(tops)
+        assert len(unique) == 1, f"Expected single row, got y levels: {unique}"
+
+
+class TestSameColumnConnectors:
+    """Connectors between vertically stacked elements use South/North ports."""
+
+    def _stacked_model(self) -> ThreatModel:
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Stacked")
+        a = Element(name="A", guid="aaaa", generic_type="GE.P")
+        b = Element(name="B", guid="bbbb", generic_type="GE.P")
+        model.elements = [a, b]
+        model.boundaries = [
+            TrustBoundary(name="TB", guid=str(uuid.uuid4()), elements=["A", "B"])
+        ]
+        model.flows = [
+            DataFlow(name="Down", guid="f1f1", source_guid="aaaa", target_guid="bbbb"),
+        ]
+        return model
+
+    def test_vertical_flow_uses_south_north_ports(self):
+        model = self._stacked_model()
+        text = TM7Generator().generate_text(model)
+        assert ">South</PortSource>" in text or ">North</PortSource>" in text, \
+            "Vertical flow should use South or North ports"
+
+    def test_vertical_flow_source_below_target(self):
+        """Source Y coordinate should be at the bottom of the source element."""
+        model = self._stacked_model()
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        source_y = _re.findall(r"<SourceY[^>]*>(\d+)</SourceY>", text)
+        target_y = _re.findall(r"<TargetY[^>]*>(\d+)</TargetY>", text)
+        # For a downward flow: SourceY (bottom of A) should be < TargetY (top of B)
+        # (there's one connector, skip LineBoundary entries if any)
+        assert int(source_y[0]) < int(target_y[0])
+
+
+class TestParallelConnectors:
+    """Multiple flows between the same elements get offset endpoints."""
+
+    def _parallel_model(self) -> ThreatModel:
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Parallel")
+        a = Element(name="A", guid="aaaa", generic_type="GE.EI")
+        b = Element(name="B", guid="bbbb", generic_type="GE.P")
+        model.elements = [a, b]
+        model.flows = [
+            DataFlow(name="F1", guid="f1f1", source_guid="aaaa", target_guid="bbbb"),
+            DataFlow(name="F2", guid="f2f2", source_guid="aaaa", target_guid="bbbb"),
+        ]
+        return model
+
+    def test_parallel_flows_have_different_endpoints(self):
+        model = self._parallel_model()
+        text = TM7Generator().generate_text(model)
+        import re as _re
+        sources = _re.findall(
+            r"<SourceX[^>]*>(\d+)</SourceX>.*?<SourceY[^>]*>(\d+)</SourceY>",
+            text, re.DOTALL)
+        targets = _re.findall(
+            r"<TargetX[^>]*>(\d+)</TargetX>.*?<TargetY[^>]*>(\d+)</TargetY>",
+            text, re.DOTALL)
+        # Both connectors should have DIFFERENT Y coordinates
+        assert len(sources) >= 2
+        assert sources[0] != sources[1], \
+            "Parallel flows must have different source endpoints"

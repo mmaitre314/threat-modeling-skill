@@ -326,8 +326,8 @@ The validator performs three phases:
 | Phase | What it checks |
 |-------|----------------|
 | **Phase 1 — DCS Deserialization** | DataContractSerializer round-trip with TMT's `SerializableModelData` type and all 45 known types. Catches z:Id/z:Ref errors, missing namespaces, wrong element ordering. |
-| **Phase 2 — XML Model Checks** | Line coordinates (source ≠ target), TypeId resolution against KnowledgeBase, nil GUID detection on connectors, stencil TypeId validation. |
-| **Phase 3 — DSM Consistency** | DrawingSurfaceModel structure (GenericTypeId, Guid, Borders, Lines, Header, Zoom). Connector SourceGuid/TargetGuid must reference elements within the **same** DSM's Borders. Threat DrawingSurfaceGuids must reference a valid DSM. |
+| **Phase 2 — XML Model Checks** | Line coordinates (source ≠ target), TypeId resolution against KnowledgeBase, nil GUID detection on connectors, stencil TypeId validation, zero-length connectors. |
+| **Phase 3 — DSM Consistency** | DrawingSurfaceModel structure (GenericTypeId, Guid, Borders, Lines, Header, Zoom). Connector SourceGuid/TargetGuid must reference elements within the **same** DSM's Borders. Threat DrawingSurfaceGuids must reference a valid DSM. Border element coordinates within canvas bounds (~1500px). Duplicate connector endpoint detection. |
 
 > **Important:** DCS deserialization passing (Phase 1) is necessary but **not sufficient** — TMT performs post-deserialization semantic validation that Phase 2 and Phase 3 catch.
 
@@ -353,6 +353,15 @@ Border boundaries use geometric containment — an element is "inside" a boundar
 ### z:Id Allocation
 
 TM7 uses `z:Id="iN"` / `z:Ref="iN"` for object identity within the DCS XML. When generating, the CLI scans the template for the maximum existing z:Id value and starts new allocations above it. This prevents collisions with KnowledgeBase entries.
+
+### Coordinate Layout Constraints
+
+TMT validates that element coordinates fall within a reasonable canvas area (~1200px wide). The CLI's layout engine automatically wraps boundary groups to new rows when the total width would exceed this limit. Key rules:
+
+- **Canvas width limit**: Elements must stay within ~1200px horizontally. Models with many boundary groups are laid out in multiple rows.
+- **Same-column connectors**: When source and target elements are stacked vertically (same Left coordinate), connectors use South/North ports instead of East/West to avoid U-shaped paths.
+- **Parallel connectors**: When multiple flows share the same source and target elements, their endpoint coordinates are offset vertically by 15px to prevent complete overlap.
+- **Border containment**: Elements inside a BorderBoundary must be geometrically within the boundary rectangle (handled automatically by the layout engine).
 
 ## Scratch Directory
 

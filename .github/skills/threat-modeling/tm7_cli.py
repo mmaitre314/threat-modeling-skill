@@ -1275,26 +1275,54 @@ class TM7Generator:
                 groups.append((tb.name, tb_groups[tb.name]))
 
         # --- 2D layout: bounded groups are vertical columns,
-        #     ungrouped elements spread horizontally ---
+        #     ungrouped elements spread horizontally.
+        #     Wraps to new rows when width exceeds MAX_CANVAS_WIDTH
+        #     to stay within TMT's expected canvas area. ---
         PAD = 30       # padding inside border boundary box
-        COL_GAP = 100  # gap between columns
+        COL_GAP = 60   # gap between columns
         ROW_GAP = 30   # gap between elements within a column
+        LAYOUT_ROW_GAP = 60  # gap between layout rows
         START_X = 50
         START_Y = 50
+        MAX_CANVAS_WIDTH = 1200  # keep layout within TMT's viewport
+
+        # Pre-calculate each group's width so we can decide row wrapping
+        def _group_width(group_els, has_boundary):
+            if has_boundary:
+                max_w = max((int(el.width) if el.width else 100) for el in group_els)
+                return max_w + 2 * PAD
+            else:
+                return sum((int(el.width) if el.width else 100) + COL_GAP for el in group_els) - COL_GAP
+
+        def _group_height(group_els, has_boundary):
+            if has_boundary:
+                total = sum((int(el.height) if el.height else 100) + ROW_GAP for el in group_els) - ROW_GAP + 2 * PAD
+                return total
+            else:
+                return max((int(el.height) if el.height else 100) for el in group_els)
 
         parts: list[str] = []
         positions: dict[str, tuple[int, int, int, int]] = {}
         boundary_rects: dict[str, tuple[int, int, int, int]] = {}  # name -> (l,t,w,h)
         z_id = z_id_start
         x_cursor = START_X
+        y_row_start = START_Y
+        row_max_height = 0
 
         for group_name, group_els in groups:
             has_boundary = group_name is not None
+            gw = _group_width(group_els, has_boundary)
+
+            # Wrap to next row if this group would exceed the canvas width
+            if x_cursor > START_X and x_cursor + gw > MAX_CANVAS_WIDTH:
+                y_row_start += row_max_height + LAYOUT_ROW_GAP
+                x_cursor = START_X
+                row_max_height = 0
 
             if has_boundary:
                 # Bounded group: stack elements vertically inside the box
                 col_x = x_cursor + PAD
-                col_y = START_Y + PAD
+                col_y = y_row_start + PAD
                 max_w = 0
                 y_cursor = col_y
                 for el in group_els:
@@ -1309,10 +1337,11 @@ class TM7Generator:
                     y_cursor += h + ROW_GAP
                     z_id += 1
                 box_left = x_cursor
-                box_top = START_Y
+                box_top = y_row_start
                 box_width = max_w + 2 * PAD
-                box_height = (y_cursor - ROW_GAP) - START_Y + PAD
+                box_height = (y_cursor - ROW_GAP) - y_row_start + PAD
                 boundary_rects[group_name] = (box_left, box_top, box_width, box_height)
+                row_max_height = max(row_max_height, box_height)
                 x_cursor = box_left + box_width + COL_GAP
             else:
                 # Ungrouped elements: lay out horizontally at the same Y level
@@ -1321,9 +1350,10 @@ class TM7Generator:
                     h = int(el.height) if el.height else 100
                     parts.append(_stencil_xml(el.guid, el.generic_type,
                                               el.type_id or el.generic_type,
-                                              el.name, h, x_cursor, START_Y, w, 1, NS,
+                                              el.name, h, x_cursor, y_row_start, w, 1, NS,
                                               z_id=f"i{z_id}"))
-                    positions[el.guid] = (x_cursor, START_Y, w, h)
+                    positions[el.guid] = (x_cursor, y_row_start, w, h)
+                    row_max_height = max(row_max_height, h)
                     x_cursor += w + COL_GAP
                     z_id += 1
 
@@ -1357,11 +1387,13 @@ class TM7Generator:
         parts: list[str] = []
         z_id = z_id_start
 
-        # Build a set of element-pair keys to detect bidirectional flows.
-        # For each pair (A,B), track which flows we've seen so we can offset
-        # the handle of the second flow in the opposite direction.
+        # Build a set of element-pair keys to detect bidirectional and parallel
+        # flows.  For each ordered pair (src,tgt), track how many flows we've
+        # seen so we can offset endpoints and handles for overlapping connectors.
+        directed_pair_seen: dict[tuple[str, str], int] = {}  # (src, tgt) -> count
         pair_seen: dict[tuple[str, str], int] = {}  # (min_guid, max_guid) -> count
         CURVE_OFFSET = 50  # pixels above/below the straight line for curves
+        PARALLEL_OFFSET = 15  # pixels to offset parallel connector endpoints
 
         for df in flows:
             sg = name_to_guid.get(df.source_guid, df.source_guid)
@@ -1370,11 +1402,31 @@ class TM7Generator:
             # Compute connector coordinates from element positions
             sx, sy, sw, sh = el_positions.get(sg, (0, 100, 100, 100))
             tx, ty, tw, th = el_positions.get(tg, (250, 100, 100, 100))
+            src_cx = sx + sw // 2
             src_cy = sy + sh // 2
+            tgt_cx = tx + tw // 2
             tgt_cy = ty + th // 2
-            # Direction-aware: source-right→target-left when source is left
-            # of target, otherwise source-left→target-right.
-            if sx <= tx:
+
+            # Direction-aware port selection with same-column handling.
+            # When source and target share the same Left, use South/North
+            # (vertical) ports instead of East/West to avoid U-shaped connectors.
+            same_column = abs(sx - tx) < sw  # elements overlap in X
+            if same_column:
+                if sy <= ty:
+                    # Source above target: bottom of source → top of target
+                    source_x = src_cx
+                    source_y = sy + sh  # bottom edge
+                    target_x = tgt_cx
+                    target_y = ty       # top edge
+                    port_source, port_target = "South", "North"
+                else:
+                    # Source below target: top of source → bottom of target
+                    source_x = src_cx
+                    source_y = sy       # top edge
+                    target_x = tgt_cx
+                    target_y = ty + th  # bottom edge
+                    port_source, port_target = "North", "South"
+            elif sx <= tx:
                 source_x = sx + sw   # right edge of source
                 source_y = src_cy
                 target_x = tx        # left edge of target
@@ -1386,6 +1438,16 @@ class TM7Generator:
                 target_x = tx + tw   # right edge of target
                 target_y = tgt_cy
                 port_source, port_target = "West", "East"
+
+            # Offset endpoints for parallel flows (same source → same target)
+            # so connectors don't completely overlap.
+            directed_key = (sg, tg)
+            directed_idx = directed_pair_seen.get(directed_key, 0)
+            directed_pair_seen[directed_key] = directed_idx + 1
+            if directed_idx > 0:
+                offset = directed_idx * PARALLEL_OFFSET
+                source_y += offset
+                target_y += offset
 
             # Handle: midpoint of the connector line, with vertical offset
             # for bidirectional pairs so the curves bow in opposite directions.

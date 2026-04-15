@@ -239,6 +239,10 @@ class Program
             if (srcX == 0 && srcY == 0 && tgtX == 0 && tgtY == 0)
                 warnings.Add("Line element coordinates are corrupted for '" + elName + "'");
 
+            // Check source == target (zero-length connector)
+            if (lineType.Contains("Connector") && srcX == tgtX && srcY == tgtY)
+                warnings.Add("Connector '" + elName + "' has zero length (source == target coordinates)");
+
             // Check TypeId is resolvable in KnowledgeBase
             var typeId = GetText(lineNode, "TypeId", nsMgr);
             if (!string.IsNullOrEmpty(typeId) && knownTypeIds.Count > 0 && !knownTypeIds.Contains(typeId))
@@ -285,6 +289,9 @@ class Program
         }
 
         // Phase 3: DrawingSurfaceModel consistency checks
+        // Also check border element coordinates beyond reasonable canvas bounds.
+        // TMT flags elements at very large coordinates as "corrupted".
+        var MAX_CANVAS = 1500;
         var dsmNodes = doc.SelectNodes("//tm:DrawingSurfaceModel", nsMgr);
         if (dsmNodes != null)
         {
@@ -326,7 +333,7 @@ class Program
                 if (zoom == null)
                     warnings.Add("DrawingSurfaceModel missing Zoom element");
 
-                // Collect element GUIDs from this DSM's Borders
+                // Collect element GUIDs from this DSM's Borders and check coordinates
                 var elementGuids = new HashSet<string>();
                 if (borders != null)
                 {
@@ -337,6 +344,46 @@ class Program
                         var guid2 = GetText(val2, "Guid", nsMgr);
                         if (!string.IsNullOrEmpty(guid2))
                             elementGuids.Add(guid2);
+
+                        // Check border element coordinates beyond canvas bounds
+                        int bLeft = ParseInt(val2, "Left", nsMgr);
+                        int bTop = ParseInt(val2, "Top", nsMgr);
+                        int bWidth = ParseInt(val2, "Width", nsMgr);
+                        int bHeight = ParseInt(val2, "Height", nsMgr);
+                        if (bLeft + bWidth > MAX_CANVAS || bTop + bHeight > MAX_CANVAS)
+                        {
+                            var bName2 = val2.SelectSingleNode("abs:Properties//kb:Value", nsMgr);
+                            var bElName = bName2 != null ? bName2.InnerText.Trim() : "(unnamed)";
+                            warnings.Add("Border element '" + bElName + "' extends beyond canvas (" + (bLeft + bWidth) + "x" + (bTop + bHeight) + " > " + MAX_CANVAS + ")");
+                        }
+                    }
+                }
+
+                // Check for duplicate connector endpoints (identical source+target positions)
+                var connectorEndpoints = new Dictionary<string, string>();
+                if (lines != null)
+                {
+                    foreach (XmlNode kv in lines.ChildNodes)
+                    {
+                        var val2 = kv.SelectSingleNode("a:Value", nsMgr);
+                        if (val2 == null) continue;
+                        var ta = (val2 is XmlElement ce) ? ce.GetAttributeNode("type", "http://www.w3.org/2001/XMLSchema-instance") : null;
+                        if (ta == null || !ta.Value.Contains("Connector")) continue;
+                        int csx = ParseInt(val2, "SourceX", nsMgr);
+                        int csy = ParseInt(val2, "SourceY", nsMgr);
+                        int ctx = ParseInt(val2, "TargetX", nsMgr);
+                        int cty = ParseInt(val2, "TargetY", nsMgr);
+                        var coordKey = csx + "," + csy + "->" + ctx + "," + cty;
+                        var n2 = val2.SelectSingleNode("abs:Properties//kb:Value", nsMgr);
+                        var cName = n2 != null ? n2.InnerText.Trim() : "(unnamed)";
+                        if (connectorEndpoints.ContainsKey(coordKey))
+                        {
+                            warnings.Add("Connectors '" + connectorEndpoints[coordKey] + "' and '" + cName + "' share identical endpoints (" + coordKey + ")");
+                        }
+                        else
+                        {
+                            connectorEndpoints[coordKey] = cName;
+                        }
                     }
                 }
 
