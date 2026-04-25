@@ -60,8 +60,14 @@ tools/
 
 ```bash
 cd .github/skills/threat-modeling
-python -m unittest discover -s tests -v
+python -m pytest tests/test_tm7_cli.py -q
 ```
+
+## Layout notes
+
+Generated TM7 diagrams use a deterministic compound layered layout. Elements inside rectangular trust boundaries are laid out locally and remain geometrically contained; trust-boundary groups and standalone elements are then arranged left-to-right from the data-flow topology. Connector routing handles same-column flows, self-loops, bidirectional flows, and parallel connectors without reusing identical endpoints.
+
+The layout investigation and implementation plan are in [docs/tm7-layout-investigation.md](docs/tm7-layout-investigation.md), [docs/graph-layout-algorithm-comparison.md](docs/graph-layout-algorithm-comparison.md), and [docs/tm7-layout-implementation-sketch.md](docs/tm7-layout-implementation-sketch.md).
 
 ## Validating TM7 files with TMT's deserializer
 

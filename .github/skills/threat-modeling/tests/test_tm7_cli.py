@@ -53,6 +53,56 @@ def _has_sample(path: Path) -> bool:
     return path.exists()
 
 
+def _xml_int(block: str, tag: str) -> int:
+    match = re.search(rf"<{tag}[^>]*>(-?\d+)</{tag}>", block)
+    assert match, f"Missing {tag} in XML block"
+    return int(match.group(1))
+
+
+def _xml_text(block: str, tag: str) -> str:
+    match = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", block)
+    assert match, f"Missing {tag} in XML block"
+    return match.group(1)
+
+
+def _stencil_boxes(text: str) -> dict[str, tuple[int, int, int, int]]:
+    boxes = {}
+    for block in re.findall(r'<a:Value[^>]*i:type="Stencil\w+".*?</a:Value>', text, re.DOTALL):
+        guid = _xml_text(block, "Guid")
+        boxes[guid] = (
+            _xml_int(block, "Left"),
+            _xml_int(block, "Top"),
+            _xml_int(block, "Width"),
+            _xml_int(block, "Height"),
+        )
+    return boxes
+
+
+def _border_boxes(text: str) -> dict[str, tuple[int, int, int, int]]:
+    boxes = {}
+    for block in re.findall(r'<a:Value[^>]*i:type="BorderBoundary".*?</a:Value>', text, re.DOTALL):
+        guid = _xml_text(block, "Guid")
+        boxes[guid] = (
+            _xml_int(block, "Left"),
+            _xml_int(block, "Top"),
+            _xml_int(block, "Width"),
+            _xml_int(block, "Height"),
+        )
+    return boxes
+
+
+def _connector_endpoints(text: str) -> list[tuple[int, int, int, int]]:
+    endpoints = []
+    for block in re.findall(r'<a:Value[^>]*i:type="Connector".*?</a:Value>', text, re.DOTALL):
+        endpoints.append((
+            _xml_int(block, "SourceX"),
+            _xml_int(block, "SourceY"),
+            _xml_int(block, "TargetX"),
+            _xml_int(block, "TargetY"),
+        ))
+    return endpoints
+
+
 SAMPLE_MD = textwrap.dedent("""\
     # Threat Model: Test System
 
@@ -1308,37 +1358,111 @@ class TestLayoutWrapping:
         unique = set(tops)
         assert len(unique) == 1, f"Expected single row, got y levels: {unique}"
 
+    def test_boundary_members_are_contained(self):
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Containment")
+        left_boundary_guid = str(uuid.uuid4())
+        right_boundary_guid = str(uuid.uuid4())
+        a = Element(name="A", guid="aaaa", generic_type="GE.P")
+        b = Element(name="B", guid="bbbb", generic_type="GE.P")
+        c = Element(name="C", guid="cccc", generic_type="GE.DS")
+        model.diagrams = [Diagram(
+            name="D1",
+            elements=[a, b, c],
+            flows=[
+                DataFlow(name="A to B", guid="f1", source_guid="aaaa", target_guid="bbbb"),
+                DataFlow(name="B to C", guid="f2", source_guid="bbbb", target_guid="cccc"),
+            ],
+            boundaries=[
+                TrustBoundary(name="Left", guid=left_boundary_guid, elements=["A", "B"]),
+                TrustBoundary(name="Right", guid=right_boundary_guid, elements=["C"]),
+            ],
+        )]
+
+        text = TM7Generator().generate_text(model)
+        stencils = _stencil_boxes(text)
+        borders = _border_boxes(text)
+        for element_guid in ("aaaa", "bbbb"):
+            element_left, element_top, element_width, element_height = stencils[element_guid]
+            boundary_left, boundary_top, boundary_width, boundary_height = borders[left_boundary_guid]
+            assert element_left >= boundary_left
+            assert element_top >= boundary_top
+            assert element_left + element_width <= boundary_left + boundary_width
+            assert element_top + element_height <= boundary_top + boundary_height
+
+    def test_data_flow_chain_progresses_left_to_right(self):
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Chain")
+        model.elements = [
+            Element(name="A", guid="aaaa", generic_type="GE.EI"),
+            Element(name="B", guid="bbbb", generic_type="GE.P"),
+            Element(name="C", guid="cccc", generic_type="GE.DS"),
+        ]
+        model.flows = [
+            DataFlow(name="A to B", guid="f1", source_guid="aaaa", target_guid="bbbb"),
+            DataFlow(name="B to C", guid="f2", source_guid="bbbb", target_guid="cccc"),
+        ]
+
+        text = TM7Generator().generate_text(model)
+        stencils = _stencil_boxes(text)
+        assert stencils["aaaa"][0] < stencils["bbbb"][0] < stencils["cccc"][0]
+
+    def test_parallel_connectors_have_distinct_endpoints(self):
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Parallel")
+        model.elements = [
+            Element(name="A", guid="aaaa", generic_type="GE.EI"),
+            Element(name="B", guid="bbbb", generic_type="GE.P"),
+        ]
+        model.flows = [
+            DataFlow(name="F1", guid="f1", source_guid="aaaa", target_guid="bbbb"),
+            DataFlow(name="F2", guid="f2", source_guid="aaaa", target_guid="bbbb"),
+            DataFlow(name="F3", guid="f3", source_guid="aaaa", target_guid="bbbb"),
+        ]
+
+        endpoints = _connector_endpoints(TM7Generator().generate_text(model))
+        assert len(endpoints) == 3
+        assert len(set(endpoints)) == 3
+
+    def test_self_loop_connector_has_non_zero_geometry(self):
+        model = ThreatModel()
+        model.meta = ThreatModelMeta(name="Loop")
+        model.elements = [Element(name="A", guid="aaaa", generic_type="GE.P")]
+        model.flows = [DataFlow(name="Loop", guid="f1", source_guid="aaaa", target_guid="aaaa")]
+
+        text = TM7Generator().generate_text(model)
+        endpoints = _connector_endpoints(text)
+        assert endpoints
+        source_x, source_y, target_x, target_y = endpoints[0]
+        assert (source_x, source_y) != (target_x, target_y)
+        assert ">East</PortSource>" in text
+        assert ">North</PortTarget>" in text
+
 
 class TestSameColumnConnectors:
     """Connectors between vertically stacked elements use South/North ports."""
 
-    def _stacked_model(self) -> ThreatModel:
-        model = ThreatModel()
-        model.meta = ThreatModelMeta(name="Stacked")
+    def _stacked_lines_xml(self) -> str:
         a = Element(name="A", guid="aaaa", generic_type="GE.P")
         b = Element(name="B", guid="bbbb", generic_type="GE.P")
-        model.elements = [a, b]
-        model.boundaries = [
-            TrustBoundary(name="TB", guid=str(uuid.uuid4()), elements=["A", "B"])
-        ]
-        model.flows = [
+        flows = [
             DataFlow(name="Down", guid="f1f1", source_guid="aaaa", target_guid="bbbb"),
         ]
-        return model
+        return TM7Generator._lines_xml(
+            [a, b], flows, [],
+            {"aaaa": (50, 50, 100, 100), "bbbb": (50, 220, 100, 100)},
+        )
 
     def test_vertical_flow_uses_south_north_ports(self):
-        model = self._stacked_model()
-        text = TM7Generator().generate_text(model)
+        text = self._stacked_lines_xml()
         assert ">South</PortSource>" in text or ">North</PortSource>" in text, \
             "Vertical flow should use South or North ports"
 
     def test_vertical_flow_source_below_target(self):
         """Source Y coordinate should be at the bottom of the source element."""
-        model = self._stacked_model()
-        text = TM7Generator().generate_text(model)
-        import re as _re
-        source_y = _re.findall(r"<SourceY[^>]*>(\d+)</SourceY>", text)
-        target_y = _re.findall(r"<TargetY[^>]*>(\d+)</TargetY>", text)
+        text = self._stacked_lines_xml()
+        source_y = re.findall(r"<SourceY[^>]*>(\d+)</SourceY>", text)
+        target_y = re.findall(r"<TargetY[^>]*>(\d+)</TargetY>", text)
         # For a downward flow: SourceY (bottom of A) should be < TargetY (top of B)
         # (there's one connector, skip LineBoundary entries if any)
         assert int(source_y[0]) < int(target_y[0])

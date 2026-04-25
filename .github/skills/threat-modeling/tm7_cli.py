@@ -202,6 +202,63 @@ class ThreatModel:
         self.diagrams[0].boundaries = value
 
 
+@dataclass(frozen=True)
+class _LayoutOptions:
+    start_x: int = 50
+    start_y: int = 50
+    element_width: int = 100
+    element_height: int = 100
+    boundary_pad: int = 35
+    node_gap_x: int = 70
+    node_gap_y: int = 70
+    rank_gap: int = 150
+    row_gap: int = 60
+    max_canvas_width: int = 1200
+    max_canvas_coord: int = 1400
+
+
+@dataclass
+class _LayoutBox:
+    left: int
+    top: int
+    width: int
+    height: int
+
+    @property
+    def right(self) -> int:
+        return self.left + self.width
+
+    @property
+    def bottom(self) -> int:
+        return self.top + self.height
+
+    @property
+    def center_x(self) -> int:
+        return self.left + self.width // 2
+
+    @property
+    def center_y(self) -> int:
+        return self.top + self.height // 2
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return (self.left, self.top, self.width, self.height)
+
+
+@dataclass
+class _LayoutItem:
+    key: str
+    width: int
+    height: int
+    order: int
+
+
+@dataclass
+class _LayoutResult:
+    element_positions: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+    boundary_positions: dict[str, tuple[int, int, int, int]] = field(default_factory=dict)
+    node_ranks: dict[str, int] = field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # STRIDE helpers
 # ---------------------------------------------------------------------------
@@ -1125,7 +1182,8 @@ class TM7Generator:
             # Single diagram: splice into the existing DrawingSurfaceModel
             diag = diagrams[0]
             borders_xml, el_positions, next_z = self._borders_xml(
-                diag.elements, z_id_start=z_start, boundaries=diag.boundaries)
+                diag.elements, z_id_start=z_start, boundaries=diag.boundaries,
+                flows=diag.flows)
             text = _splice_section(text, "Borders", borders_xml)
             text = _splice_section(text, "Lines",
                                    self._lines_xml(diag.elements, diag.flows,
@@ -1142,7 +1200,8 @@ class TM7Generator:
                 dsm_z_id = f"i{z_id}"
                 z_id += 1
                 borders_xml, el_positions, z_id = self._borders_xml(
-                    diag.elements, z_id_start=z_id, boundaries=diag.boundaries)
+                    diag.elements, z_id_start=z_id, boundaries=diag.boundaries,
+                    flows=diag.flows)
                 lines_xml = self._lines_xml(diag.elements, diag.flows,
                                             diag.boundaries, el_positions,
                                             z_id_start=z_id)
@@ -1231,13 +1290,302 @@ class TM7Generator:
     # --- fragment builders (self-contained namespace declarations) ---
 
     @staticmethod
+    def _element_box(el: Element) -> _LayoutBox:
+        width = int(el.width) if el.width else _LayoutOptions.element_width
+        height = int(el.height) if el.height else _LayoutOptions.element_height
+        return _LayoutBox(0, 0, width, height)
+
+    @staticmethod
+    def _resolve_endpoint(value: str, name_to_guid: dict[str, str]) -> str:
+        return name_to_guid.get(value, value)
+
+    @staticmethod
+    def _would_create_cycle(source_key: str, target_key: str,
+                            adjacency: dict[str, set[str]]) -> bool:
+        stack = [target_key]
+        seen: set[str] = set()
+        while stack:
+            current_key = stack.pop()
+            if current_key == source_key:
+                return True
+            if current_key in seen:
+                continue
+            seen.add(current_key)
+            stack.extend(adjacency.get(current_key, set()))
+        return False
+
+    @staticmethod
+    def _pack_items(items: dict[str, _LayoutItem], options: _LayoutOptions,
+                    start_x: int, start_y: int) -> tuple[dict[str, _LayoutBox], dict[str, int]]:
+        boxes: dict[str, _LayoutBox] = {}
+        ranks: dict[str, int] = {}
+        x_cursor = start_x
+        y_cursor = start_y
+        row_height = 0
+        row_rank = 0
+        for item in sorted(items.values(), key=lambda item: item.order):
+            if x_cursor > start_x and x_cursor + item.width > options.max_canvas_width:
+                x_cursor = start_x
+                y_cursor += row_height + options.row_gap
+                row_height = 0
+                row_rank += 1
+            boxes[item.key] = _LayoutBox(x_cursor, y_cursor, item.width, item.height)
+            ranks[item.key] = row_rank
+            x_cursor += item.width + options.node_gap_x
+            row_height = max(row_height, item.height)
+        return boxes, ranks
+
+    @staticmethod
+    def _layout_items(items: dict[str, _LayoutItem],
+                      edges: list[tuple[str, str, int, int]],
+                      options: _LayoutOptions,
+                      start_x: int,
+                      start_y: int) -> tuple[dict[str, _LayoutBox], dict[str, int]]:
+        if not items:
+            return {}, {}
+
+        valid_edges = [
+            (source_key, target_key, weight, edge_order)
+            for source_key, target_key, weight, edge_order in edges
+            if source_key in items and target_key in items and source_key != target_key
+        ]
+        if not valid_edges:
+            return TM7Generator._pack_items(items, options, start_x, start_y)
+
+        order_by_key = {key: item.order for key, item in items.items()}
+        dag_edges: list[tuple[str, str, int, int]] = []
+        adjacency: dict[str, set[str]] = {key: set() for key in items}
+        for source_key, target_key, weight, edge_order in sorted(
+                valid_edges, key=lambda edge: (edge[3], order_by_key[edge[0]], order_by_key[edge[1]])):
+            if TM7Generator._would_create_cycle(source_key, target_key, adjacency):
+                continue
+            adjacency[source_key].add(target_key)
+            dag_edges.append((source_key, target_key, weight, edge_order))
+
+        predecessors: dict[str, list[tuple[str, int]]] = {key: [] for key in items}
+        successors: dict[str, list[tuple[str, int]]] = {key: [] for key in items}
+        indegree: dict[str, int] = {key: 0 for key in items}
+        for source_key, target_key, weight, _edge_order in dag_edges:
+            successors[source_key].append((target_key, weight))
+            predecessors[target_key].append((source_key, weight))
+            indegree[target_key] += 1
+
+        topo_queue = sorted([key for key, degree in indegree.items() if degree == 0],
+                            key=lambda key: order_by_key[key])
+        topo_order: list[str] = []
+        while topo_queue:
+            current_key = topo_queue.pop(0)
+            topo_order.append(current_key)
+            for next_key, _weight in sorted(successors[current_key], key=lambda item: order_by_key[item[0]]):
+                indegree[next_key] -= 1
+                if indegree[next_key] == 0:
+                    topo_queue.append(next_key)
+                    topo_queue.sort(key=lambda key: order_by_key[key])
+
+        for key in sorted(items, key=lambda key: order_by_key[key]):
+            if key not in topo_order:
+                topo_order.append(key)
+
+        ranks: dict[str, int] = {key: 0 for key in items}
+        for source_key in topo_order:
+            for target_key, _weight in successors[source_key]:
+                ranks[target_key] = max(ranks[target_key], ranks[source_key] + 1)
+
+        max_rank = max(ranks.values(), default=0)
+        layers: dict[int, list[str]] = {rank: [] for rank in range(max_rank + 1)}
+        for key in sorted(items, key=lambda key: order_by_key[key]):
+            layers[ranks[key]].append(key)
+
+        def weighted_center(neighbors: list[tuple[str, int]], positions: dict[str, int], fallback: int) -> float:
+            available = [(positions[key], weight) for key, weight in neighbors if key in positions]
+            if not available:
+                return float(fallback)
+            total_weight = sum(weight for _position, weight in available) or 1
+            return sum(position * weight for position, weight in available) / total_weight
+
+        for _sweep in range(4):
+            for rank in range(1, max_rank + 1):
+                previous_positions = {key: index for index, key in enumerate(layers[rank - 1])}
+                layers[rank].sort(key=lambda key: (
+                    weighted_center(predecessors[key], previous_positions, order_by_key[key]),
+                    order_by_key[key],
+                    key,
+                ))
+            for rank in range(max_rank - 1, -1, -1):
+                next_positions = {key: index for index, key in enumerate(layers[rank + 1])}
+                layers[rank].sort(key=lambda key: (
+                    weighted_center(successors[key], next_positions, order_by_key[key]),
+                    order_by_key[key],
+                    key,
+                ))
+
+        rank_widths = {
+            rank: max((items[key].width for key in layer_keys), default=0)
+            for rank, layer_keys in layers.items()
+        }
+        rank_lefts: dict[int, int] = {}
+        x_cursor = start_x
+        for rank in range(max_rank + 1):
+            rank_lefts[rank] = x_cursor
+            x_cursor += rank_widths[rank] + options.rank_gap
+
+        boxes: dict[str, _LayoutBox] = {}
+        for rank, layer_keys in layers.items():
+            y_cursor = start_y
+            for key in layer_keys:
+                item = items[key]
+                boxes[key] = _LayoutBox(rank_lefts[rank], y_cursor, item.width, item.height)
+                y_cursor += item.height + options.node_gap_y
+
+        return boxes, ranks
+
+    @staticmethod
+    def _compute_layout(elements: list[Element], flows: list[DataFlow] | None,
+                        boundaries: list[TrustBoundary] | None) -> _LayoutResult:
+        options = _LayoutOptions()
+        flows = flows or []
+        boundaries = boundaries or []
+        result = _LayoutResult()
+        if not elements:
+            return result
+
+        name_to_guid = {element.name: element.guid for element in elements}
+        guid_to_element = {element.guid: element for element in elements}
+        element_order = {element.guid: index for index, element in enumerate(elements)}
+
+        element_to_boundary: dict[str, str] = {}
+        members_by_boundary: dict[str, list[Element]] = {tb.name: [] for tb in boundaries if tb.elements}
+        for tb in boundaries:
+            for element_name in tb.elements:
+                element_guid = name_to_guid.get(element_name)
+                if element_guid and element_guid not in element_to_boundary and tb.name in members_by_boundary:
+                    element_to_boundary[element_guid] = tb.name
+
+        ungrouped: list[Element] = []
+        for element in elements:
+            boundary_name = element_to_boundary.get(element.guid)
+            if boundary_name:
+                members_by_boundary[boundary_name].append(element)
+            else:
+                ungrouped.append(element)
+
+        local_positions: dict[str, _LayoutBox] = {}
+        boundary_sizes: dict[str, _LayoutBox] = {}
+        top_items: dict[str, _LayoutItem] = {}
+        top_key_by_element: dict[str, str] = {}
+
+        boundary_order = {tb.name: index for index, tb in enumerate(boundaries)}
+        for boundary_name, member_elements in members_by_boundary.items():
+            if not member_elements:
+                continue
+            member_guids = {element.guid for element in member_elements}
+            local_items: dict[str, _LayoutItem] = {}
+            for element in member_elements:
+                element_box = TM7Generator._element_box(element)
+                local_items[element.guid] = _LayoutItem(
+                    key=element.guid,
+                    width=element_box.width,
+                    height=element_box.height,
+                    order=element_order[element.guid],
+                )
+
+            local_edges: list[tuple[str, str, int, int]] = []
+            for flow_order, data_flow in enumerate(flows):
+                source_guid = TM7Generator._resolve_endpoint(data_flow.source_guid, name_to_guid)
+                target_guid = TM7Generator._resolve_endpoint(data_flow.target_guid, name_to_guid)
+                if source_guid in member_guids and target_guid in member_guids and source_guid != target_guid:
+                    local_edges.append((source_guid, target_guid, 1, flow_order))
+
+            local_options = _LayoutOptions(max_canvas_width=650)
+            member_boxes, _member_ranks = TM7Generator._layout_items(
+                local_items, local_edges, local_options, 0, 0)
+            max_right = max((box.right for box in member_boxes.values()), default=options.element_width)
+            max_bottom = max((box.bottom for box in member_boxes.values()), default=options.element_height)
+            boundary_width = max_right + 2 * options.boundary_pad
+            boundary_height = max_bottom + 2 * options.boundary_pad
+            boundary_sizes[boundary_name] = _LayoutBox(0, 0, boundary_width, boundary_height)
+
+            for element_guid, box in member_boxes.items():
+                local_positions[element_guid] = _LayoutBox(
+                    box.left + options.boundary_pad,
+                    box.top + options.boundary_pad,
+                    box.width,
+                    box.height,
+                )
+                top_key_by_element[element_guid] = f"tb:{boundary_name}"
+
+            first_member_order = min(element_order[element.guid] for element in member_elements)
+            top_items[f"tb:{boundary_name}"] = _LayoutItem(
+                key=f"tb:{boundary_name}",
+                width=boundary_width,
+                height=boundary_height,
+                order=first_member_order + boundary_order.get(boundary_name, 0),
+            )
+
+        for element in ungrouped:
+            element_box = TM7Generator._element_box(element)
+            top_key = f"el:{element.guid}"
+            top_key_by_element[element.guid] = top_key
+            top_items[top_key] = _LayoutItem(
+                key=top_key,
+                width=element_box.width,
+                height=element_box.height,
+                order=element_order[element.guid],
+            )
+
+        edge_weights: dict[tuple[str, str], tuple[int, int]] = {}
+        for flow_order, data_flow in enumerate(flows):
+            source_guid = TM7Generator._resolve_endpoint(data_flow.source_guid, name_to_guid)
+            target_guid = TM7Generator._resolve_endpoint(data_flow.target_guid, name_to_guid)
+            source_top_key = top_key_by_element.get(source_guid)
+            target_top_key = top_key_by_element.get(target_guid)
+            if not source_top_key or not target_top_key or source_top_key == target_top_key:
+                continue
+            weight, first_order = edge_weights.get((source_top_key, target_top_key), (0, flow_order))
+            edge_weights[(source_top_key, target_top_key)] = (weight + 1, min(first_order, flow_order))
+        top_edges = [
+            (source_key, target_key, weight, first_order)
+            for (source_key, target_key), (weight, first_order) in edge_weights.items()
+        ]
+
+        top_boxes, top_ranks = TM7Generator._layout_items(
+            top_items, top_edges, options, options.start_x, options.start_y)
+
+        boundary_name_by_key = {f"tb:{name}": name for name in boundary_sizes}
+        for top_key, top_box in top_boxes.items():
+            boundary_name = boundary_name_by_key.get(top_key)
+            if boundary_name:
+                result.boundary_positions[boundary_name] = top_box.as_tuple()
+                for element_guid, element_top_key in top_key_by_element.items():
+                    if element_top_key != top_key:
+                        continue
+                    local_box = local_positions[element_guid]
+                    final_box = _LayoutBox(
+                        top_box.left + local_box.left,
+                        top_box.top + local_box.top,
+                        local_box.width,
+                        local_box.height,
+                    )
+                    result.element_positions[element_guid] = final_box.as_tuple()
+                    result.node_ranks[element_guid] = top_ranks.get(top_key, 0)
+            else:
+                element_guid = top_key.removeprefix("el:")
+                if element_guid in guid_to_element:
+                    result.element_positions[element_guid] = top_box.as_tuple()
+                    result.node_ranks[element_guid] = top_ranks.get(top_key, 0)
+
+        return result
+
+    @staticmethod
     def _borders_xml(elements: list[Element], z_id_start: int = 3,
-                     boundaries: list['TrustBoundary'] | None = None) -> tuple[str, dict, int]:
+                     boundaries: list['TrustBoundary'] | None = None,
+                     flows: list[DataFlow] | None = None) -> tuple[str, dict, int]:
         """Return (xml_fragment, {guid: (left, top, width, height)}, next_z_id).
 
-        Elements are laid out in columns grouped by trust boundary membership.
-        Boundaries with elements are emitted as BorderBoundary boxes that
-        geometrically contain their member elements.
+        Elements are laid out by a deterministic two-level layered layout.
+        Populated trust boundaries become compound nodes that contain member
+        elements, while ungrouped elements participate directly in the top-level
+        graph.
         """
         if not elements and not boundaries:
             return "", {}, z_id_start
@@ -1249,122 +1597,27 @@ class TM7Generator:
             "i": "http://www.w3.org/2001/XMLSchema-instance",
             "xs": "http://www.w3.org/2001/XMLSchema",
         }
-
-        # --- Group elements by boundary membership ---
-        in_boundary: dict[str, str] = {}  # element name -> boundary name
-        for tb in boundaries:
-            for ename in tb.elements:
-                in_boundary[ename] = tb.name
-
-        # Ordered groups: first boundaries (in order), then ungrouped
-        groups: list[tuple[str | None, list[Element]]] = []
-        ungrouped: list[Element] = []
-        tb_groups: dict[str, list[Element]] = {tb.name: [] for tb in boundaries if tb.elements}
-        for el in elements:
-            bname = in_boundary.get(el.name)
-            if bname and bname in tb_groups:
-                tb_groups[bname].append(el)
-            else:
-                ungrouped.append(el)
-
-        # Ungrouped first (leftmost), then boundary groups in order
-        if ungrouped:
-            groups.append((None, ungrouped))
-        for tb in boundaries:
-            if tb.elements and tb.name in tb_groups and tb_groups[tb.name]:
-                groups.append((tb.name, tb_groups[tb.name]))
-
-        # --- 2D layout: bounded groups are vertical columns,
-        #     ungrouped elements spread horizontally.
-        #     Wraps to new rows when width exceeds MAX_CANVAS_WIDTH
-        #     to stay within TMT's expected canvas area. ---
-        PAD = 30       # padding inside border boundary box
-        COL_GAP = 60   # gap between columns
-        ROW_GAP = 30   # gap between elements within a column
-        LAYOUT_ROW_GAP = 60  # gap between layout rows
-        START_X = 50
-        START_Y = 50
-        MAX_CANVAS_WIDTH = 1200  # keep layout within TMT's viewport
-
-        # Pre-calculate each group's width so we can decide row wrapping
-        def _group_width(group_els, has_boundary):
-            if has_boundary:
-                max_w = max((int(el.width) if el.width else 100) for el in group_els)
-                return max_w + 2 * PAD
-            else:
-                return sum((int(el.width) if el.width else 100) + COL_GAP for el in group_els) - COL_GAP
-
-        def _group_height(group_els, has_boundary):
-            if has_boundary:
-                total = sum((int(el.height) if el.height else 100) + ROW_GAP for el in group_els) - ROW_GAP + 2 * PAD
-                return total
-            else:
-                return max((int(el.height) if el.height else 100) for el in group_els)
-
         parts: list[str] = []
-        positions: dict[str, tuple[int, int, int, int]] = {}
-        boundary_rects: dict[str, tuple[int, int, int, int]] = {}  # name -> (l,t,w,h)
+        layout = TM7Generator._compute_layout(elements, flows, boundaries)
+        positions = layout.element_positions
         z_id = z_id_start
-        x_cursor = START_X
-        y_row_start = START_Y
-        row_max_height = 0
 
-        for group_name, group_els in groups:
-            has_boundary = group_name is not None
-            gw = _group_width(group_els, has_boundary)
-
-            # Wrap to next row if this group would exceed the canvas width
-            if x_cursor > START_X and x_cursor + gw > MAX_CANVAS_WIDTH:
-                y_row_start += row_max_height + LAYOUT_ROW_GAP
-                x_cursor = START_X
-                row_max_height = 0
-
-            if has_boundary:
-                # Bounded group: stack elements vertically inside the box
-                col_x = x_cursor + PAD
-                col_y = y_row_start + PAD
-                max_w = 0
-                y_cursor = col_y
-                for el in group_els:
-                    w = int(el.width) if el.width else 100
-                    h = int(el.height) if el.height else 100
-                    parts.append(_stencil_xml(el.guid, el.generic_type,
-                                              el.type_id or el.generic_type,
-                                              el.name, h, col_x, y_cursor, w, 1, NS,
-                                              z_id=f"i{z_id}"))
-                    positions[el.guid] = (col_x, y_cursor, w, h)
-                    max_w = max(max_w, w)
-                    y_cursor += h + ROW_GAP
-                    z_id += 1
-                box_left = x_cursor
-                box_top = y_row_start
-                box_width = max_w + 2 * PAD
-                box_height = (y_cursor - ROW_GAP) - y_row_start + PAD
-                boundary_rects[group_name] = (box_left, box_top, box_width, box_height)
-                row_max_height = max(row_max_height, box_height)
-                x_cursor = box_left + box_width + COL_GAP
-            else:
-                # Ungrouped elements: lay out horizontally at the same Y level
-                for el in group_els:
-                    w = int(el.width) if el.width else 100
-                    h = int(el.height) if el.height else 100
-                    parts.append(_stencil_xml(el.guid, el.generic_type,
-                                              el.type_id or el.generic_type,
-                                              el.name, h, x_cursor, y_row_start, w, 1, NS,
-                                              z_id=f"i{z_id}"))
-                    positions[el.guid] = (x_cursor, y_row_start, w, h)
-                    row_max_height = max(row_max_height, h)
-                    x_cursor += w + COL_GAP
-                    z_id += 1
+        for el in elements:
+            left, top, width, height = positions.get(el.guid, (50, 50, 100, 100))
+            parts.append(_stencil_xml(el.guid, el.generic_type,
+                                      el.type_id or el.generic_type,
+                                      el.name, height, left, top, width, 1, NS,
+                                      z_id=f"i{z_id}"))
+            z_id += 1
 
         # Emit border boundaries
         tb_by_name = {tb.name: tb for tb in boundaries}
-        for bname, (bl, bt, bw, bh) in boundary_rects.items():
-            tb = tb_by_name[bname]
+        for boundary_name, (left, top, width, height) in layout.boundary_positions.items():
+            tb = tb_by_name[boundary_name]
             # TypeId = tb.guid so it matches the StandardElement entry we add to KB
             parts.append(_border_boundary_xml(
                 tb.guid, tb.guid,
-                bname, bh, bl, bt, bw, NS,
+                boundary_name, height, left, top, width, NS,
                 z_id=f"i{z_id}"))
             z_id += 1
 
@@ -1387,13 +1640,27 @@ class TM7Generator:
         parts: list[str] = []
         z_id = z_id_start
 
-        # Build a set of element-pair keys to detect bidirectional and parallel
-        # flows.  For each ordered pair (src,tgt), track how many flows we've
-        # seen so we can offset endpoints and handles for overlapping connectors.
-        directed_pair_seen: dict[tuple[str, str], int] = {}  # (src, tgt) -> count
-        pair_seen: dict[tuple[str, str], int] = {}  # (min_guid, max_guid) -> count
-        CURVE_OFFSET = 50  # pixels above/below the straight line for curves
-        PARALLEL_OFFSET = 15  # pixels to offset parallel connector endpoints
+        directed_pair_total: dict[tuple[str, str], int] = {}
+        for df in flows:
+            source_guid = name_to_guid.get(df.source_guid, df.source_guid)
+            target_guid = name_to_guid.get(df.target_guid, df.target_guid)
+            directed_pair_total[(source_guid, target_guid)] = directed_pair_total.get((source_guid, target_guid), 0) + 1
+
+        directed_pair_seen: dict[tuple[str, str], int] = {}
+        pair_seen: dict[tuple[str, str], int] = {}
+        CURVE_OFFSET = 50
+        SELF_LOOP_OFFSET = 70
+
+        def _spread(index: int, total: int, span: int) -> int:
+            if total <= 1:
+                return 0
+            step = min(20, max(10, span // (total + 1)))
+            return int(round((index - (total - 1) / 2) * step))
+
+        def _clamp(value: int, lower: int, upper: int) -> int:
+            if lower > upper:
+                return value
+            return max(lower, min(upper, value))
 
         for df in flows:
             sg = name_to_guid.get(df.source_guid, df.source_guid)
@@ -1407,61 +1674,65 @@ class TM7Generator:
             tgt_cx = tx + tw // 2
             tgt_cy = ty + th // 2
 
-            # Direction-aware port selection with same-column handling.
-            # When source and target share the same Left, use South/North
-            # (vertical) ports instead of East/West to avoid U-shaped connectors.
-            same_column = abs(sx - tx) < sw  # elements overlap in X
-            if same_column:
-                if sy <= ty:
-                    # Source above target: bottom of source → top of target
-                    source_x = src_cx
-                    source_y = sy + sh  # bottom edge
-                    target_x = tgt_cx
-                    target_y = ty       # top edge
-                    port_source, port_target = "South", "North"
-                else:
-                    # Source below target: top of source → bottom of target
-                    source_x = src_cx
-                    source_y = sy       # top edge
-                    target_x = tgt_cx
-                    target_y = ty + th  # bottom edge
-                    port_source, port_target = "North", "South"
-            elif sx <= tx:
-                source_x = sx + sw   # right edge of source
-                source_y = src_cy
-                target_x = tx        # left edge of target
-                target_y = tgt_cy
-                port_source, port_target = "East", "West"
-            else:
-                source_x = sx        # left edge of source
-                source_y = src_cy
-                target_x = tx + tw   # right edge of target
-                target_y = tgt_cy
-                port_source, port_target = "West", "East"
-
-            # Offset endpoints for parallel flows (same source → same target)
-            # so connectors don't completely overlap.
             directed_key = (sg, tg)
             directed_idx = directed_pair_seen.get(directed_key, 0)
             directed_pair_seen[directed_key] = directed_idx + 1
-            if directed_idx > 0:
-                offset = directed_idx * PARALLEL_OFFSET
-                source_y += offset
-                target_y += offset
 
-            # Handle: midpoint of the connector line, with vertical offset
-            # for bidirectional pairs so the curves bow in opposite directions.
-            handle_x = (source_x + target_x) // 2
-            handle_y = (source_y + target_y) // 2
-            pair_key = (min(sg, tg), max(sg, tg))
-            pair_idx = pair_seen.get(pair_key, 0)
-            pair_seen[pair_key] = pair_idx + 1
-            if pair_idx == 0:
-                # First flow in pair: curve upward
-                handle_y -= CURVE_OFFSET
+            if sg == tg and sg in el_positions:
+                loop_offset = directed_idx * 20
+                source_x = sx + sw
+                source_y = src_cy
+                target_x = src_cx
+                target_y = sy
+                handle_x = sx + sw + SELF_LOOP_OFFSET + loop_offset
+                handle_y = max(10, sy - SELF_LOOP_OFFSET - loop_offset)
+                port_source, port_target = "East", "North"
             else:
-                # Second flow in pair: curve downward
-                handle_y += CURVE_OFFSET
+                total_directed = directed_pair_total.get(directed_key, 1)
+                x_delta = tgt_cx - src_cx
+                y_delta = tgt_cy - src_cy
+                same_column = abs(src_cx - tgt_cx) < max(sw, tw) // 2
+                use_vertical = same_column or abs(y_delta) > abs(x_delta) * 1.4
+                if use_vertical:
+                    endpoint_offset = _spread(directed_idx, total_directed, min(sw, tw))
+                    if sy <= ty:
+                        source_x = _clamp(src_cx + endpoint_offset, sx + 15, sx + sw - 15)
+                        source_y = sy + sh
+                        target_x = _clamp(tgt_cx + endpoint_offset, tx + 15, tx + tw - 15)
+                        target_y = ty
+                        port_source, port_target = "South", "North"
+                    else:
+                        source_x = _clamp(src_cx + endpoint_offset, sx + 15, sx + sw - 15)
+                        source_y = sy
+                        target_x = _clamp(tgt_cx + endpoint_offset, tx + 15, tx + tw - 15)
+                        target_y = ty + th
+                        port_source, port_target = "North", "South"
+                elif sx <= tx:
+                    endpoint_offset = _spread(directed_idx, total_directed, min(sh, th))
+                    source_x = sx + sw
+                    source_y = _clamp(src_cy + endpoint_offset, sy + 15, sy + sh - 15)
+                    target_x = tx
+                    target_y = _clamp(tgt_cy + endpoint_offset, ty + 15, ty + th - 15)
+                    port_source, port_target = "East", "West"
+                else:
+                    endpoint_offset = _spread(directed_idx, total_directed, min(sh, th))
+                    source_x = sx
+                    source_y = _clamp(src_cy + endpoint_offset, sy + 15, sy + sh - 15)
+                    target_x = tx + tw
+                    target_y = _clamp(tgt_cy + endpoint_offset, ty + 15, ty + th - 15)
+                    port_source, port_target = "West", "East"
+
+                handle_x = (source_x + target_x) // 2
+                handle_y = (source_y + target_y) // 2
+                pair_key = (min(sg, tg), max(sg, tg))
+                pair_idx = pair_seen.get(pair_key, 0)
+                pair_seen[pair_key] = pair_idx + 1
+                curve_direction = -1 if pair_idx % 2 == 0 else 1
+                curve_magnitude = CURVE_OFFSET + (pair_idx // 2) * 20
+                if port_source in ("East", "West"):
+                    handle_y += curve_direction * curve_magnitude
+                else:
+                    handle_x += curve_direction * curve_magnitude
 
             parts.append(
                 f'<a:KeyValueOfguidanyType xmlns:a="{NS["a"]}">'
@@ -1503,8 +1774,10 @@ class TM7Generator:
             if tb.elements:
                 continue  # already in Borders as BorderBoundary
             tb_generic = "GE.TB.L" if tb.generic_type == "GE.TB" else tb.generic_type
-            # Place boundary line between elements; shift each boundary right
-            tb_x = 270 + tb_x_offset
+            # Keep empty boundary separators near the drawing instead of at a
+            # fixed x coordinate that can cut through unrelated elements.
+            max_right = max((left + width for left, _, width, _ in el_positions.values()), default=200)
+            tb_x = min(max_right + 80 + tb_x_offset, 1300)
             tb_x_offset += 250
             parts.append(_line_boundary_xml(
                 tb.guid, tb_generic, tb_generic,

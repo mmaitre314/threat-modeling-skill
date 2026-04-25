@@ -194,6 +194,13 @@ Each element has a `Properties` collection of typed attributes:
 Each `Connector` (data flow) in the Lines section carries endpoint and
 handle coordinates that control the visual path of the arrow.
 
+The CLI's template-safe TM7 generator computes coordinates with a deterministic
+compound layered layout. Elements inside rectangular trust boundaries are laid
+out within their parent boundary first; populated boundaries and standalone
+elements are then arranged as top-level nodes from left to right using data-flow
+edges. This keeps BorderBoundary containment valid while making most flows read
+in their natural direction.
+
 ### Direction-Aware Endpoints
 
 Connectors are direction-aware.  When the **source element is to the left**
@@ -210,6 +217,11 @@ arrives at the left edge of the target:
 When the source is to the **right** of the target, the edges and ports
 are reversed (`West` → `East`).
 
+When the source and target are stacked vertically with nearly the same X
+coordinate, the connector uses South/North ports. Self-loops use a non-zero
+loop from the element edge back to its top edge so TMT does not collapse the
+line.
+
 ### Bidirectional Curve Offsets
 
 When two flows connect the same pair of elements in opposite directions
@@ -223,11 +235,17 @@ HandleX is always the horizontal midpoint between source and target.
 An offset of ~50 px produces visually distinct curves matching TMT's
 default layout.
 
+Multiple flows with the same source and target are also spread along the
+source/target element edges. This prevents duplicate connector endpoint
+coordinates, which TMT can otherwise normalize into unreadable overlapping
+arrows.
+
 ### LineBoundary Coordinates
 
 Trust boundary lines (type `LineBoundary`) are vertical lines spanning
 the element area.  SourceX ≈ TargetX, SourceY = top of area,
-TargetY = bottom of area.
+TargetY = bottom of area. Empty trust boundaries are placed to the right of
+the current drawing area instead of through existing elements.
 
 ## Serialization Gotchas
 

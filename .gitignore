@@ -209,3 +209,4 @@ __marimo__/
 # Build artifacts
 tools/bin/
 tools/obj/
+_tmp

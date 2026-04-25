@@ -356,12 +356,17 @@ TM7 uses `z:Id="iN"` / `z:Ref="iN"` for object identity within the DCS XML. When
 
 ### Coordinate Layout Constraints
 
-TMT validates that element coordinates fall within a reasonable canvas area (~1200px wide). The CLI's layout engine automatically wraps boundary groups to new rows when the total width would exceed this limit. Key rules:
+TMT validates that element coordinates fall within a reasonable canvas area (~1200px wide). The CLI's template-safe TM7 generator uses a deterministic compound layered layout tuned for small data-flow diagrams:
 
-- **Canvas width limit**: Elements must stay within ~1200px horizontally. Models with many boundary groups are laid out in multiple rows.
-- **Same-column connectors**: When source and target elements are stacked vertically (same Left coordinate), connectors use South/North ports instead of East/West to avoid U-shaped paths.
-- **Parallel connectors**: When multiple flows share the same source and target elements, their endpoint coordinates are offset vertically by 15px to prevent complete overlap.
-- **Border containment**: Elements inside a BorderBoundary must be geometrically within the boundary rectangle (handled automatically by the layout engine).
+- **Two-level containment**: Elements listed in a BorderBoundary are laid out locally first, and the boundary rectangle is sized around them with padding.
+- **Flow-aware placement**: The top-level graph is layered left-to-right from data-flow direction. Populated trust boundaries are treated as compound nodes, and cross-boundary flows become weighted top-level edges.
+- **Canvas width limit**: Disconnected or edgeless groups are packed into rows to stay within the normal TMT canvas bounds.
+- **Same-column connectors**: Vertically stacked source/target pairs use South/North ports instead of East/West to avoid U-shaped paths.
+- **Self-loop connectors**: Self-flows get non-zero loop geometry so TMT does not collapse the connector.
+- **Parallel connectors**: Multiple flows sharing the same source and target are spread along element edges and use distinct handles to prevent duplicate endpoints.
+- **Border containment**: Elements inside a BorderBoundary must be geometrically within the boundary rectangle; the generator enforces this automatically.
+
+See `docs/tm7-layout-investigation.md` for the algorithm review and `docs/tm7-layout-implementation-sketch.md` for implementation notes.
 
 ## Scratch Directory
 
